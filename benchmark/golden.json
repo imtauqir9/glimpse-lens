@@ -1,0 +1,14 @@
+{
+  "_comment": "Real labeled set for a live bench run. Two real arXiv papers; recall measured live. bench runs under the isolated BENCH_USER tenant, so it won't touch the demo corpus. Modest multipliers keep the run quick + cheap (each recall/decoupling query calls the LLM).",
+  "backfill_multiplier": 2,
+  "resilience_multiplier": 2,
+  "documents": [
+    {"uri": "https://arxiv.org/pdf/2312.10997", "kind": "paper", "title": "RAG Survey"},
+    {"uri": "https://arxiv.org/pdf/2005.11401", "kind": "paper", "title": "RAG Original"}
+  ],
+  "queries": [
+    {"question": "how does hybrid dense and sparse retrieval improve recall", "expect_title": "RAG Survey", "expect_kind": "paper"},
+    {"question": "naive versus advanced versus modular RAG paradigms", "expect_title": "RAG Survey", "expect_kind": "paper"},
+    {"question": "retrieval augmented generation for knowledge intensive NLP tasks", "expect_title": "RAG Original", "expect_kind": "paper"}
+  ]
+}

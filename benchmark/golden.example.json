@@ -1,0 +1,15 @@
+{
+  "_comment": "Copy to golden.json and fill with REAL labeled queries. Never fabricate recall — every number bench.py reports must come from a real run. 'documents' are ingested by the harness (drives accept-latency + throughput); 'queries' each name the ONE source that should appear in the top-10 citations (drives cross-source recall@10). Include at least one paper, one deck, and (if seeded) one video so recall proves CROSS-source retrieval.",
+  "backfill_multiplier": 5,
+  "resilience_multiplier": 3,
+  "documents": [
+    {"uri": "https://arxiv.org/pdf/2312.10997", "kind": "paper", "title": "RAG Survey"},
+    {"uri": "https://arxiv.org/pdf/2005.11401", "kind": "paper", "title": "RAG Original"},
+    {"uri": "https://example.com/your-deck.pdf", "kind": "deck", "title": "Architecture Deck"}
+  ],
+  "queries": [
+    {"question": "what is hybrid dense plus sparse retrieval", "expect_title": "RAG Survey", "expect_kind": "paper"},
+    {"question": "retrieval augmented generation for knowledge intensive tasks", "expect_title": "RAG Original", "expect_kind": "paper"},
+    {"question": "unified vector index architecture overview", "expect_title": "Architecture Deck", "expect_kind": "deck"}
+  ]
+}

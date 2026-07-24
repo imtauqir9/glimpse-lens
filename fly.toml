@@ -1,0 +1,78 @@
+# Fly.io — one image, two process groups (same pattern as digital-twin-akash):
+#   api    — stateless, always-startable, auto-stops when idle
+#   worker — polls Prefect Cloud for ingest runs (outbound only, no ports)
+#
+# Bucket: `fly storage create` provisions Tigris and injects the AWS_* secrets
+# automatically — then just `fly secrets set STORAGE_PROVIDER=flyio`.
+#
+# fly launch --no-deploy --copy-config
+# Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^FLY_' } | fly secrets import
+# fly deploy --ha=false
+# fly scale count worker=2        # more ingest throughput, anytime
+
+app = 'glimpse-lens'
+primary_region = 'iad'
+
+[build]
+
+[deploy]
+  # Startup gate: index the four sample talks BEFORE the new version goes live —
+  # if it can't, the deploy aborts and the old version keeps serving, so users
+  # never hit a half-indexed app. Runs in a temporary machine where the clip
+  # service isn't up yet, so CLIP_SERVICE_URL= forces in-process embedding.
+  # Idempotent + durable (Qdrant Cloud): real work happens only on first deploy.
+  release_command = "sh -c 'CLIP_SERVICE_URL= python -m src.seed'"
+
+[processes]
+  api = 'uvicorn src.app:app --host 0.0.0.0 --port 8000'
+  worker = 'python -m src.worker'
+  # Must bind IPv6 (::) — Fly private networking (*.internal, used by
+  # CLIP_SERVICE_URL) is IPv6-only; 0.0.0.0 would be unreachable internally.
+  clip = 'uvicorn src.clip_service:app --host :: --port 8001'
+
+[env]
+  # Fly private networking: <process>.process.<app>.internal resolves to the
+  # clip machine. api + worker send embed batches there (one warm model);
+  # clip_service itself ignores this and always runs the model locally.
+  CLIP_SERVICE_URL = 'http://clip.process.glimpse-lens.internal:8001'
+
+# Infra backstop: if a machine's process ever exits (crash, OOM, a dependency
+# outage that slips past the code's own retry loop), always bring it back —
+# don't leave it stopped. The worker's serve() also self-heals in code
+# (src/worker.py); this is defense in depth so a fresh clone survives blips.
+[[restart]]
+  policy = 'always'
+  retries = 10
+  processes = ['worker', 'clip']
+
+# api restarts only on failure — so its money-saving idle auto-stop isn't
+# undone by the restart policy.
+[[restart]]
+  policy = 'on-failure'
+  retries = 10
+  processes = ['api']
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = 'stop'
+  auto_start_machines = true
+  min_machines_running = 0
+  processes = ['api']
+
+[[vm]]
+  size = 'shared-cpu-1x'
+  memory = '512mb'        # embedding happens in the clip service, api stays thin
+  processes = ['api']
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  # Runs are light now (download + ffmpeg; embedding is remote) — 2gb fits
+  # WORKER_CONCURRENCY=2. Scale workers horizontally, not vertically.
+  memory = '2gb'
+  processes = ['worker']
+
+[[vm]]
+  size = 'shared-cpu-2x'
+  memory = '2gb'          # the one warm CLIP model (~1.5gb loaded)
+  processes = ['clip']

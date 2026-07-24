@@ -1,0 +1,40 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.python-version
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# Runtime data (videos, extracted frames, qdrant storage)
+data/
+backend/data/
+qdrant_storage/
+
+# Model caches
+.cache/
+*.pt
+*.onnx
+
+# Node / frontend
+node_modules/
+dist/
+
+# Benchmark caches (keep bench.py + golden set for grading)
+benchmark/__pycache__/
+benchmark/qdrant_*/
+
+# Internal design notes (not published)
+MULTIMODAL_RETRIEVAL.md
+
+# OS / editor
+.DS_Store
+.idea/
+.vscode/
+*.log

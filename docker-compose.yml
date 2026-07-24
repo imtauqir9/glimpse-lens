@@ -1,0 +1,81 @@
+# Local dev stack. Durable state lives in managed services from .env — Neon
+# (DATABASE_URL), object storage, Qdrant Cloud, Prefect Cloud for the work
+# queue — so every container here is stateless and disposable.
+#   docker compose up --build
+#   API + UI:        http://localhost:8000
+#   Run/queue view:  https://app.prefect.cloud -> Runs
+# Vector store is Qdrant Cloud via QDRANT_URL in .env. To run a local Qdrant
+# instead, add a qdrant service here and blank QDRANT_URL.
+services:
+  # The inference service: ONE warm CLIP model behind a URL. api + worker send
+  # batches here instead of each flow run paying a fresh ~15-30s model load.
+  # Scaling embedding = scaling THIS service (CPU here; same container on a
+  # GPU machine later — only CLIP_SERVICE_URL changes).
+  clip:
+    build: .
+    command: uvicorn src.clip_service:app --host 0.0.0.0 --port 8001
+    env_file: .env
+    volumes:
+      - hf_cache:/root/.cache     # model weights cached across restarts
+    restart: unless-stopped
+
+  # STARTUP GATE — indexes the four sample talks and exits. api + worker wait
+  # for it to finish (service_completed_successfully), so the UI is NEVER
+  # reachable with a half-indexed corpus: when localhost:8000 answers, the
+  # samples are ready. Idempotent + durable (Qdrant Cloud) — after the first
+  # successful run this exits in seconds. First run takes a few minutes
+  # (model download + 4 videos); watch its logs: docker compose logs -f seed
+  seed:
+    build: .
+    command: python -m src.seed
+    env_file: .env
+    environment:
+      CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/root/.cache
+    depends_on:
+      - clip
+    restart: "no"
+
+  api:
+    build: .
+    ports:
+      - "8000:8000"
+    env_file: .env
+    environment:
+      CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+    volumes:
+      - ./data:/app/data          # STORAGE_PROVIDER=local only (dev)
+      - hf_cache:/root/.cache
+    depends_on:
+      clip:
+        condition: service_started
+      seed:
+        condition: service_completed_successfully   # UI up only after samples ready
+    restart: unless-stopped
+
+  worker:
+    build: .
+    command: python -m src.worker
+    env_file: .env
+    environment:
+      CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+      # One worker process executes up to WORKER_CONCURRENCY runs at once.
+      # With the clip service doing the embedding, each run is light
+      # (download + ffmpeg only) — raise this without adding RAM for models.
+      WORKER_CONCURRENCY: 2
+    volumes:
+      - ./data:/app/data
+      - hf_cache:/root/.cache
+    depends_on:
+      clip:
+        condition: service_started
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+    # Need more throughput? Replicas multiply it (all share the one clip model):
+    # docker compose up -d --scale worker=3   (-> 6 videos at once)
+
+volumes:
+  hf_cache:
