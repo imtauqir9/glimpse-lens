@@ -22,7 +22,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import config, db, jobs, storage
+from .. import auth, config, db, jobs, storage
 from ..samples import is_sample
 from ..config import (
     ADMIN_TOKEN,
@@ -41,18 +41,18 @@ _YT_RE = re.compile(
     r"(?:youtube\.com/(?:watch\?v=|shorts/|live/|embed/)|youtu\.be/)([A-Za-z0-9_-]{11})")
 
 
-def require_auth(authorization: str | None = Header(default=None)) -> None:
-    if not ADMIN_TOKEN:  # dev convenience — set ADMIN_TOKEN in any real deploy
-        return
-    if authorization != f"Bearer {ADMIN_TOKEN}":
-        raise HTTPException(401, "Missing or invalid bearer token.")
+def require_auth(authorization: str | None = Header(default=None),
+                 x_api_key: str | None = Header(default=None),
+                 x_user_id: str | None = Header(default=None)) -> None:
+    # Mutations require the ADMIN role (API-key auth + RBAC, src/auth.py).
+    auth.check_admin(authorization, x_api_key, x_user_id)
 
 
-def user_id(x_user_id: str | None = Header(default=None)) -> str:
-    uid = (x_user_id or DEFAULT_USER_ID).strip()
-    if not _USER_RE.match(uid):
-        raise HTTPException(400, "Invalid X-User-Id.")
-    return uid
+def user_id(authorization: str | None = Header(default=None),
+            x_api_key: str | None = Header(default=None),
+            x_user_id: str | None = Header(default=None)) -> str:
+    # Tenant comes from the KEY when auth is active (not the spoofable header).
+    return auth.resolve_identity(authorization, x_api_key, x_user_id)[0]
 
 
 # ── Presign ───────────────────────────────────────────────────────────────────

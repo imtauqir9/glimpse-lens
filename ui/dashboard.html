@@ -81,6 +81,15 @@
 
 <script>
 const $ = id => document.getElementById(id);
+/* +AUTH: send the stored API key (set on the main app) with the metrics fetch */
+const _fetch = window.fetch.bind(window);
+window.fetch = (url, opts={}) => {
+  try{ const k = localStorage.getItem('glk_key') || '';
+    if(k && typeof url==='string' && url.startsWith('/'))
+      opts = {...opts, headers:{...(opts.headers||{}), 'Authorization':'Bearer '+k}};
+  }catch(e){}
+  return _fetch(url, opts);
+};
 const fmt = n => (n||0).toLocaleString();
 function statusColor(s){ s=+s; return s<300?'bg-[#dcfce7] text-[#166534]': s<400?'bg-[#dbeafe] text-[#1e40af]': s<500?'bg-[#fef3c7] text-[#92400e]':'bg-[#fee2e2] text-[#991b1b]'; }
 

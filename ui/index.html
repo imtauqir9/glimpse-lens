@@ -47,7 +47,8 @@
     <div class="w-8 h-8 rounded-lg bg-coral flex items-center justify-center text-white font-bold display">G</div>
     <span class="font-bold tracking-tight">Glimpse</span>
     <span class="text-muted text-sm hidden sm:inline">· multimodal search</span>
-    <a href="/dashboard" class="ml-auto text-xs font-semibold text-coral2 hover:text-coral" title="Live metrics: tokens, cost, latency, queue">📊 Dashboard</a>
+    <a id="authLink" href="#" class="ml-auto text-xs font-semibold text-coral2 hover:text-coral">🔑 Sign in</a>
+    <a href="/dashboard" class="text-xs font-semibold text-coral2 hover:text-coral" title="Live metrics: tokens, cost, latency, queue">📊 Dashboard</a>
     <span id="llmBadge" class="text-xs px-3 py-1 rounded-full border border-line text-muted">checking…</span>
   </div>
 </header>
@@ -159,6 +160,31 @@
 
 <script>
 const $=s=>document.querySelector(s);
+/* +AUTH: attach the stored API key (glk_...) to every SAME-ORIGIN request.
+   Wrapping fetch means every search/ingest/admin call is authenticated without
+   editing each call. The absolute-URL S3 upload PUT is never touched. */
+const KEY_LS='glk_key';
+const getKey=()=>localStorage.getItem(KEY_LS)||'';
+const setKey=k=>{ k?localStorage.setItem(KEY_LS,k):localStorage.removeItem(KEY_LS); };
+const _fetch=window.fetch.bind(window);
+window.fetch=(url,opts={})=>{
+  try{
+    const u=(typeof url==='string')?url:(url&&url.url);
+    const k=getKey();
+    if(k && typeof u==='string' && u.startsWith('/')){
+      opts={...opts, headers:{...(opts.headers||{}), 'Authorization':'Bearer '+k}};
+    }
+  }catch(e){}
+  return _fetch(url,opts);
+};
+(function(){ const el=$("#authLink"); if(!el) return;
+  const refresh=()=>{ el.textContent=getKey()?"🔑 Signed in":"🔑 Sign in"; };
+  el.onclick=e=>{ e.preventDefault();
+    if(getKey()){ if(confirm("Sign out (clear your API key)?")){ setKey(''); location.reload(); } }
+    else{ const k=prompt("Paste your Glimpse Lens API key (glk_…):"); if(k){ setKey(k.trim()); location.reload(); } }
+  };
+  refresh();
+})();
 const esc=s=>String(s==null?"":s).replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]));
 let CITES=[];
 const MODE = window.MS_MODE || "sample";   // "sample" (curated, read-only) | "full" (add your own)

@@ -23,7 +23,7 @@ from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
 
-from . import config, db, db_documents, metrics
+from . import auth, config, db, db_documents, metrics
 from .api.admin import router as admin_router
 from .api.search import router as search_router
 from .api.videos import router as videos_router
@@ -34,6 +34,7 @@ from .rag import vector_store
 async def lifespan(app: FastAPI):
     db.init_schema()
     db_documents.add_kind_column()  # idempotent: add `kind` to ms_videos for paper/deck
+    auth.init_schema()              # ms_api_keys table (API-key auth + RBAC)
     # Create the Qdrant collection up front (known CLIP dims resolve without
     # loading the model) so a question before the first ingest returns
     # "no moments" instead of a 500. Qdrant being down must not block boot.

@@ -94,3 +94,29 @@ def list_sources(uid: str = Depends(user_id), kind: str | None = None):
     if kind and kind not in (*_KINDS, "video"):
         raise HTTPException(400, "kind filter must be video|paper|deck.")
     return {"sources": db_documents.list_sources(uid, kind=kind)}
+
+
+# ── API-key management (admin only) — Phase 1 auth ───────────────────────────
+
+class KeyRequest(BaseModel):
+    user_id: str                 # tenant the key belongs to
+    role: str = "viewer"         # "admin" | "viewer"
+    label: str | None = None
+
+
+@router.post("/keys", status_code=201, dependencies=[Depends(require_auth)])
+def create_key(req: KeyRequest):
+    """Mint an API key for a tenant + role. Returns the plaintext key ONCE."""
+    from .. import auth
+    try:
+        token = auth.mint_key(req.user_id, req.role.strip().lower(), req.label)
+    except ValueError as e:
+        raise HTTPException(400, str(e))
+    return {"api_key": token, "user_id": req.user_id, "role": req.role,
+            "note": "Store this now — only its hash is kept; it can't be shown again."}
+
+
+@router.get("/keys", dependencies=[Depends(require_auth)])
+def list_api_keys():
+    from .. import auth
+    return {"keys": auth.list_keys()}

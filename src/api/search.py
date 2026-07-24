@@ -39,7 +39,7 @@ def health():
     return {"ok": True}
 
 
-@router.get("/api/metrics.json")
+@router.get("/api/metrics.json", dependencies=[Depends(require_auth)])   # +AUTH: admin only
 def metrics_json():
     """JSON rollup the dashboard polls: totals, latency percentiles, token/cost,
     and live ingest queue depth."""
@@ -67,7 +67,7 @@ def dashboard():
     return "<h1>Glimpse Lens — dashboard</h1><p>ui/dashboard.html not found.</p>"
 
 
-@router.get("/metrics")
+@router.get("/metrics", dependencies=[Depends(require_auth)])   # +AUTH: admin only
 def metrics_endpoint():
     """Prometheus metrics (design §10): request latency histograms + counters,
     plus live ingest queue-depth gauges computed from Postgres at scrape time."""
@@ -185,10 +185,9 @@ class AskRequest(BaseModel):
 
 
 @router.post("/api/ask")
-def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
+def ask(req: AskRequest, uid: str = Depends(user_id_dep)):   # +AUTH: valid key required; tenant from key
     if not req.question.strip():
         raise HTTPException(400, "Empty question.")
-    uid = _uid(x_user_id)
     from .. import guardrails                              # +GUARD: abuse/fairness (§11)
     try:
         guardrails.check_rate(uid)
@@ -206,14 +205,13 @@ def ask(req: AskRequest, x_user_id: str | None = Header(default=None)):
 
 
 @router.post("/api/retrieve")
-def retrieve_only(req: AskRequest, x_user_id: str | None = Header(default=None)):
+def retrieve_only(req: AskRequest, uid: str = Depends(user_id_dep)):   # +AUTH
     """Retrieval WITHOUT LLM synthesis — returns cited candidates only. Cheap
     (embed + ANN, milliseconds), so it's the honest way to measure search/decoupling
     latency (the design's decoupling SLA is about retrieval, not the seconds-long
     multimodal LLM call)."""
     if not req.question.strip():
         raise HTTPException(400, "Empty question.")
-    uid = _uid(x_user_id)
     from .. import guardrails
     try:
         guardrails.check_rate(uid)
