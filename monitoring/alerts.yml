@@ -1,0 +1,35 @@
+groups:
+  - name: glimpse-slo
+    rules:
+      - alert: HighErrorRate
+        expr: |
+          sum(rate(glimpse_requests_total{status=~"5.."}[5m]))
+          / clamp_min(sum(rate(glimpse_requests_total[5m])), 1) > 0.05
+        for: 2m
+        labels: { severity: warning }
+        annotations:
+          summary: "Over 5% of requests are 5xx (last 5m)"
+
+      - alert: SearchLatencyP95High
+        expr: |
+          histogram_quantile(0.95,
+            sum(rate(glimpse_request_duration_seconds_bucket{route="/api/retrieve"}[5m])) by (le)
+          ) > 1.5
+        for: 5m
+        labels: { severity: warning }
+        annotations:
+          summary: "Retrieval p95 latency > 1.5s (decoupling SLA at risk)"
+
+      - alert: RateLimitSpike
+        expr: sum(increase(glimpse_rate_limited_total[5m])) > 50
+        for: 1m
+        labels: { severity: warning }
+        annotations:
+          summary: "More than 50 rate-limited requests in 5m (possible abuse)"
+
+      - alert: LLMCostSpike
+        expr: increase(glimpse_llm_cost_usd_total[1h]) > 5
+        for: 5m
+        labels: { severity: critical }
+        annotations:
+          summary: "LLM spend exceeded $5 in the last hour (runaway cost)"

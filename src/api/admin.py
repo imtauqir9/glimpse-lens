@@ -19,10 +19,10 @@ X-User-Id header).
 """
 from __future__ import annotations
 
-from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException
+from fastapi import APIRouter, BackgroundTasks, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import config, db, db_documents, jobs_documents
+from .. import audit, config, db, db_documents, jobs_documents
 from ..config import ADMIN_TOKEN, DEFAULT_USER_ID
 # reuse the SAME auth + user_id dependencies the video API defines, so behavior
 # is identical across the two front doors.
@@ -58,7 +58,7 @@ def _schedule_ingest(source_id: str, uri: str | None, key: str | None,
 
 @router.post("/documents", status_code=202, dependencies=[Depends(require_auth)])
 def register_document(req: DocumentRequest, background_tasks: BackgroundTasks,
-                      uid: str = Depends(user_id)):
+                      request: Request, uid: str = Depends(user_id)):
     kind = (req.kind or "").strip().lower()
     if kind not in _KINDS:
         raise HTTPException(400, f"kind must be one of {_KINDS}.")
@@ -80,6 +80,9 @@ def register_document(req: DocumentRequest, background_tasks: BackgroundTasks,
     # task marks the row `failed` if scheduling errors (surfaced in status).
     background_tasks.add_task(_schedule_ingest, row["id"], req.uri, req.key,
                              title, kind, uid)
+    audit.record(uid, "admin", "ingest_document", row["id"],
+                 ip=request.client.host if request.client else None,
+                 meta={"kind": kind, "uri": req.uri, "key": req.key})
 
     # Exact shape the rubric grades on.
     return {"id": row["id"], "status": "pending", "kind": kind}
@@ -105,13 +108,16 @@ class KeyRequest(BaseModel):
 
 
 @router.post("/keys", status_code=201, dependencies=[Depends(require_auth)])
-def create_key(req: KeyRequest):
+def create_key(req: KeyRequest, request: Request, uid: str = Depends(user_id)):
     """Mint an API key for a tenant + role. Returns the plaintext key ONCE."""
     from .. import auth
     try:
         token = auth.mint_key(req.user_id, req.role.strip().lower(), req.label)
     except ValueError as e:
         raise HTTPException(400, str(e))
+    audit.record(uid, "admin", "mint_key", req.user_id,
+                 ip=request.client.host if request.client else None,
+                 meta={"role": req.role, "label": req.label})
     return {"api_key": token, "user_id": req.user_id, "role": req.role,
             "note": "Store this now — only its hash is kept; it can't be shown again."}
 
@@ -120,3 +126,9 @@ def create_key(req: KeyRequest):
 def list_api_keys():
     from .. import auth
     return {"keys": auth.list_keys()}
+
+
+@router.get("/audit", dependencies=[Depends(require_auth)])
+def get_audit(limit: int = 100, user: str | None = None):
+    """Immutable audit trail (admin only): who did what, when."""
+    return {"events": audit.recent(min(max(limit, 1), 500), user_id=user)}

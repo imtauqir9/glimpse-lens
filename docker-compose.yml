@@ -84,5 +84,37 @@ services:
     image: redis:7-alpine
     restart: unless-stopped
 
+  # Monitoring (Phase 3): Prometheus scrapes /metrics; Grafana visualizes it.
+  prometheus:
+    image: prom/prometheus:latest
+    env_file: .env   # for $ADMIN_TOKEN (the /metrics scrape is admin-gated)
+    entrypoint:
+      - /bin/sh
+      - -c
+      - 'printf "%s" "$$ADMIN_TOKEN" > /tmp/prom_token && exec /bin/prometheus --config.file=/etc/prometheus/prometheus.yml --storage.tsdb.path=/prometheus'
+    volumes:
+      - ./monitoring/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./monitoring/alerts.yml:/etc/prometheus/alerts.yml:ro
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+    depends_on:
+      - api
+
+  grafana:
+    image: grafana/grafana:latest
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: admin
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./monitoring/grafana/dashboards:/var/lib/grafana/dashboards:ro
+    ports:
+      - "3000:3000"
+    restart: unless-stopped
+    depends_on:
+      - prometheus
+
 volumes:
   hf_cache:

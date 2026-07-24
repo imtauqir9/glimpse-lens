@@ -1,0 +1,50 @@
+{
+  "title": "Glimpse Lens — Observability",
+  "uid": "glimpse-obs",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": true,
+  "refresh": "10s",
+  "time": { "from": "now-1h", "to": "now" },
+  "timezone": "browser",
+  "panels": [
+    {
+      "id": 1, "type": "stat", "title": "LLM cost ($ total)",
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "currencyUSD", "decimals": 4 } },
+      "targets": [ { "expr": "sum(glimpse_llm_cost_usd_total)", "refId": "A" } ]
+    },
+    {
+      "id": 2, "type": "stat", "title": "Tokens (in + out)",
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "sum(glimpse_llm_input_tokens_total) + sum(glimpse_llm_output_tokens_total)", "refId": "A" } ]
+    },
+    {
+      "id": 3, "type": "stat", "title": "Rate-limited (total)",
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "sum(glimpse_rate_limited_total)", "refId": "A" } ]
+    },
+    {
+      "id": 4, "type": "stat", "title": "Requests (total)",
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "sum(glimpse_requests_total)", "refId": "A" } ]
+    },
+    {
+      "id": 5, "type": "timeseries", "title": "Request rate (req/s) by route",
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "targets": [ { "expr": "sum(rate(glimpse_requests_total[1m])) by (route)", "legendFormat": "{{route}}", "refId": "A" } ]
+    },
+    {
+      "id": 6, "type": "timeseries", "title": "Retrieval p95 latency (s)",
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 5 },
+      "datasource": { "type": "prometheus", "uid": "prometheus" },
+      "fieldConfig": { "defaults": { "unit": "s" } },
+      "targets": [ { "expr": "histogram_quantile(0.95, sum(rate(glimpse_request_duration_seconds_bucket{route=\"/api/retrieve\"}[5m])) by (le))", "refId": "A" } ]
+    }
+  ]
+}

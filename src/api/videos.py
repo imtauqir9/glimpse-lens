@@ -22,7 +22,7 @@ from pathlib import Path
 from fastapi import APIRouter, Depends, Header, HTTPException, Request
 from pydantic import BaseModel
 
-from .. import auth, config, db, jobs, storage
+from .. import audit, auth, config, db, jobs, storage
 from ..samples import is_sample
 from ..config import (
     ADMIN_TOKEN,
@@ -189,7 +189,7 @@ def retry(video_id: str, uid: str = Depends(user_id)):
 
 
 @router.delete("/{video_id}", dependencies=[Depends(require_auth)])
-def delete(video_id: str, uid: str = Depends(user_id)):
+def delete(video_id: str, request: Request, uid: str = Depends(user_id)):
     """Deleting a video purges everything: vectors, thumbnails, the raw upload,
     and the manifest row — batch calls where the provider supports them.
     Sample videos are protected (unselect them from a query instead)."""
@@ -204,4 +204,7 @@ def delete(video_id: str, uid: str = Depends(user_id)):
     if row.get("storage_key"):
         storage.delete_key(row["storage_key"])
     db.delete_video(video_id)
+    audit.record(uid, "admin", "delete", video_id,
+                 ip=request.client.host if request.client else None,
+                 meta={"kind": row.get("kind"), "title": row.get("title")})
     return {"ok": True, "video_id": video_id}
