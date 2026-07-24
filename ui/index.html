@@ -450,8 +450,10 @@ $("#go").onclick=async()=>{
     // +DOC: always add indexed papers/decks so search is cross-source.
     const scoped = SELECTABLE() ? [...SELECTED] : SAMPLE_INDEXED;
     const video_ids = [...scoped, ...DOC_INDEXED];
-    const r=await (await fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},
-      body:JSON.stringify({question:q, video_ids})})).json();
+    const resp=await fetch("/api/ask",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({question:q, video_ids})});
+    if(resp.status===401){ $("#article").innerHTML=`<p class="text-muted">🔑 Please <b>sign in</b> to search — click <b>Sign in</b> at the top right.</p>`; return; }
+    const r=await resp.json();
     CITES=r.citations||[];
     let html="";
     if(r.answer) html+=`<div class="prose-body fade-in">${renderMarkdown(r.answer)}</div>`;
@@ -462,6 +464,24 @@ $("#go").onclick=async()=>{
   }catch(e){ $("#article").innerHTML=`<p class="text-coral2">Error: ${esc(e.message)}</p>`; }
   finally{ $("#go").disabled=false; $("#go").textContent="→"; }
 };
+
+/* +DEMO: cost-safe auto-preview — when signed in, show cited moments for a
+   default query on load, using the FREE /api/retrieve (no LLM cost). Lets a
+   visitor witness the system working passively before typing anything. */
+async function autoPreview(){
+  if(!getKey()) return;                               // only when signed in
+  const q="how do large language models work";
+  try{
+    const scoped = SELECTABLE() ? [...SELECTED] : SAMPLE_INDEXED;
+    const r=await (await fetch("/api/retrieve",{method:"POST",headers:{"Content-Type":"application/json"},
+      body:JSON.stringify({question:q, video_ids:[...scoped, ...DOC_INDEXED]})})).json();
+    CITES=r.citations||[];
+    if(!CITES.length) return;
+    $("#resultsWrap").classList.remove("hidden");
+    $("#article").innerHTML=`<p class="text-muted text-sm">👋 <b>Live demo</b> — top sources for <b>“${esc(q)}”</b>. Click a source to jump to it, or ask anything above for a full cited answer.</p>`;
+    renderSources();
+  }catch(e){}
+}
 
 function renderSources(){
   $("#sources").innerHTML=CITES.map(c=>{
@@ -495,8 +515,8 @@ function renderSources(){
     }
     const mods=(c.modalities||[]);
     const tags=mods.map(m=>m==="frame"
-      ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2">seen</span>'
-      : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]">said</span>').join(" ");
+      ? '<span class="text-[9px] px-1 rounded bg-coral/15 text-coral2" title="Matched what is shown on screen (CLIP visual search)">👁 on screen</span>'
+      : '<span class="text-[9px] px-1 rounded bg-[#cfe8d6] text-[#1f7a43]" title="Matched what was said (transcript)">💬 in transcript</span>').join(" ");
     // Text-only moments have no frame; they're always YouTube, so fall back to
     // the video's thumbnail instead of an empty "(no frame)" placeholder.
     const yid = ytId(c);
@@ -566,13 +586,18 @@ document.addEventListener("keydown",e=>{ if(e.key==="Escape") closeModal(); });
 /* citation pills inside the answer */
 $("#article").addEventListener("click",e=>{ const c=e.target.closest(".cite"); if(c) playCitation(+c.dataset.n); });
 
-/* examples */
-const EXAMPLES=["a diagram of the attention mechanism","an animation of a neural network",
-  "a slide listing examples of large language models","a person speaking on stage next to slides"];
+/* examples — click a chip to RUN the query instantly (zero-friction "aha") */
+const EXAMPLES=["how do large language models work","what is retrieval augmented generation",
+  "explain the attention mechanism","what is a forward deployed engineer"];
 $("#examples").innerHTML=EXAMPLES.map(q=>`<span class="chip">${esc(q)}</span>`).join("");
-$("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{ qEl.value=c.textContent; autogrow(); qEl.focus(); });
+$("#examples").querySelectorAll(".chip").forEach(c=>c.onclick=()=>{
+  qEl.value=c.textContent; autogrow();
+  $("#go").click();                                   // instant-fire, no extra step
+  $("#resultsWrap")?.scrollIntoView({behavior:"smooth", block:"start"});
+});
 
 applyMode(); loadConfig(); loadVideos(); loadDocs();
+setTimeout(autoPreview, 1600);   // +DEMO: passive "witness it working" on load (free retrieve)
 </script>
 </body>
 </html>
