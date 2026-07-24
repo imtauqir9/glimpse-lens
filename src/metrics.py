@@ -78,3 +78,73 @@ def render() -> str:
         out.append(f"{name}_count{_fmt(labels)} {hcount.get((name, labels), 0.0):g}")
 
     return "\n".join(out) + "\n"
+
+
+# ── Token + cost metering (design §18) ───────────────────────────────────────
+_PRICE_PER_M = {  # ($ per 1M input tokens, $ per 1M output tokens)
+    "claude-opus-4-8": (5.0, 25.0),   "claude-opus-4-7": (5.0, 25.0),
+    "claude-sonnet-5": (3.0, 15.0),   "claude-haiku-4-5": (1.0, 5.0),
+    "gpt-4o-mini": (0.15, 0.60),      "gpt-4o": (2.5, 10.0),
+}
+
+
+def record_tokens(model: str, in_tok: int, out_tok: int) -> None:
+    """Record actual LLM token usage + $ cost, labelled by model."""
+    inc("glimpse_llm_input_tokens_total", {"model": model}, in_tok)
+    inc("glimpse_llm_output_tokens_total", {"model": model}, out_tok)
+    pin, pout = _PRICE_PER_M.get(model, (0.0, 0.0))
+    inc("glimpse_llm_cost_usd_total", {"model": model},
+        in_tok / 1e6 * pin + out_tok / 1e6 * pout)
+
+
+def _pct(bucket: dict, count: float, q: float) -> float:
+    if count <= 0:
+        return 0.0
+    target = q * count
+    for le in _BUCKETS:
+        if bucket.get(le, 0.0) >= target:
+            return le
+    return _BUCKETS[-1]
+
+
+def snapshot() -> dict:
+    """JSON-friendly rollup for the dashboard: totals, per-route latency
+    percentiles, request status breakdown, token + cost totals."""
+    with _lock:
+        counters = {(n, l): v for (n, l), v in _counters.items()}
+        hcount = dict(_hcount)
+        hsum = dict(_hsum)
+        hbucket = {k: dict(v) for k, v in _hbucket.items()}
+
+    def total(name):
+        return sum(v for (n, _), v in counters.items() if n == name)
+
+    latency = {}
+    for (name, labels), cnt in hcount.items():
+        if name != "glimpse_request_duration_seconds":
+            continue
+        route = dict(labels).get("route", "?")
+        b = hbucket.get((name, labels), {})
+        latency[route] = {
+            "count": cnt,
+            "avg_ms": round(hsum.get((name, labels), 0.0) / cnt * 1000, 1) if cnt else 0,
+            "p50_ms": round(_pct(b, cnt, 0.5) * 1000, 1),
+            "p95_ms": round(_pct(b, cnt, 0.95) * 1000, 1),
+        }
+
+    by_status = {}
+    for (name, labels), v in counters.items():
+        if name == "glimpse_requests_total":
+            st = str(dict(labels).get("status", "?"))
+            by_status[st] = by_status.get(st, 0) + v
+
+    return {
+        "requests_total": total("glimpse_requests_total"),
+        "llm_answers_total": total("glimpse_llm_answers_total"),
+        "rate_limited_total": total("glimpse_rate_limited_total"),
+        "input_tokens": total("glimpse_llm_input_tokens_total"),
+        "output_tokens": total("glimpse_llm_output_tokens_total"),
+        "cost_usd": round(total("glimpse_llm_cost_usd_total"), 4),
+        "latency": latency,
+        "by_status": by_status,
+    }

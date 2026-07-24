@@ -39,6 +39,34 @@ def health():
     return {"ok": True}
 
 
+@router.get("/api/metrics.json")
+def metrics_json():
+    """JSON rollup the dashboard polls: totals, latency percentiles, token/cost,
+    and live ingest queue depth."""
+    from .. import db, metrics
+    snap = metrics.snapshot()
+    sources: dict = {}
+    try:
+        with db.pool().connection() as conn:
+            for r in conn.execute(
+                "SELECT kind, status, count(*) AS n FROM ms_videos GROUP BY kind, status"
+            ).fetchall():
+                sources.setdefault(r["kind"] or "video", {})[r["status"]] = r["n"]
+    except Exception:
+        pass
+    snap["sources"] = sources
+    return snap
+
+
+@router.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    """Self-contained observability dashboard (tokens, cost, latency, queue)."""
+    fp = UI_DIR / "dashboard.html"
+    if fp.exists():
+        return fp.read_text(encoding="utf-8")
+    return "<h1>Glimpse Lens — dashboard</h1><p>ui/dashboard.html not found.</p>"
+
+
 @router.get("/metrics")
 def metrics_endpoint():
     """Prometheus metrics (design §10): request latency histograms + counters,

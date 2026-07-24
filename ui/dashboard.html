@@ -1,0 +1,126 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Glimpse Lens — Observability</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Space+Grotesk:wght@500;600;700&family=Inter:wght@400;500;600;700&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script>
+  tailwind.config = { theme: { extend: {
+    colors: { paper:"#F7F8FA", card:"#FFFFFF", ink:"#1E293B", muted:"#64748B",
+              line:"#E2E8F0", blue:"#2563EB", green:"#16A34A", orange:"#F97316", violet:"#7C3AED" },
+    fontFamily: { display:['Space Grotesk','Inter','sans-serif'], sans:['Inter','system-ui','sans-serif'] },
+  }}}
+</script>
+<style>
+  body{background:#F7F8FA;color:#1E293B;font-family:Inter,system-ui,sans-serif}
+  .display{font-family:'Space Grotesk',Inter,sans-serif;letter-spacing:-.02em}
+  .tile{background:#fff;border:1px solid #E2E8F0;border-radius:16px;padding:18px 20px}
+  th,td{padding:8px 12px;text-align:left;font-size:13px}
+  thead th{color:#64748B;font-weight:600;border-bottom:1px solid #E2E8F0}
+  tbody tr{border-bottom:1px solid #F1F5F9}
+  .pill{font-size:11px;font-weight:700;padding:2px 8px;border-radius:999px}
+</style>
+</head>
+<body class="min-h-screen">
+<header class="border-b border-line bg-white">
+  <div class="max-w-6xl mx-auto px-6 py-4 flex items-center gap-3">
+    <div class="w-8 h-8 rounded-lg bg-blue flex items-center justify-center text-white font-bold display">G</div>
+    <span class="font-bold tracking-tight">Glimpse Lens</span>
+    <span class="text-muted text-sm hidden sm:inline">· Observability</span>
+    <a href="/" class="ml-auto text-sm text-blue hover:underline">← back to app</a>
+  </div>
+</header>
+
+<main class="max-w-6xl mx-auto px-6 py-8">
+  <div class="flex items-baseline justify-between mb-5">
+    <h1 class="display text-2xl font-700">Live metrics</h1>
+    <span id="updated" class="text-xs text-muted">connecting…</span>
+  </div>
+
+  <!-- TILES -->
+  <section class="grid grid-cols-2 md:grid-cols-3 lg:grid-cols-6 gap-3 mb-8">
+    <div class="tile"><div class="text-muted text-xs">LLM cost (est.)</div><div id="t_cost" class="display text-2xl font-700 text-orange">$0.0000</div></div>
+    <div class="tile"><div class="text-muted text-xs">Input tokens</div><div id="t_in" class="display text-2xl font-700 text-blue">0</div></div>
+    <div class="tile"><div class="text-muted text-xs">Output tokens</div><div id="t_out" class="display text-2xl font-700 text-violet">0</div></div>
+    <div class="tile"><div class="text-muted text-xs">LLM answers</div><div id="t_ans" class="display text-2xl font-700">0</div></div>
+    <div class="tile"><div class="text-muted text-xs">Requests</div><div id="t_req" class="display text-2xl font-700">0</div></div>
+    <div class="tile"><div class="text-muted text-xs">Rate-limited</div><div id="t_rl" class="display text-2xl font-700 text-orange">0</div></div>
+  </section>
+
+  <div class="grid lg:grid-cols-2 gap-6">
+    <!-- LATENCY -->
+    <section class="tile">
+      <h2 class="display font-600 mb-2">Request latency <span class="text-muted text-xs font-normal">(per route)</span></h2>
+      <div class="overflow-x-auto">
+        <table class="w-full"><thead><tr><th>Route</th><th>Count</th><th>Avg</th><th>p50</th><th>p95</th></tr></thead>
+        <tbody id="lat"></tbody></table>
+      </div>
+    </section>
+
+    <!-- SOURCES / QUEUE -->
+    <section class="tile">
+      <h2 class="display font-600 mb-2">Ingest queue &amp; index <span class="text-muted text-xs font-normal">(live from Postgres)</span></h2>
+      <div class="overflow-x-auto">
+        <table class="w-full"><thead><tr><th>Kind</th><th>Status</th><th>Count</th></tr></thead>
+        <tbody id="src"></tbody></table>
+      </div>
+    </section>
+
+    <!-- STATUS CODES -->
+    <section class="tile lg:col-span-2">
+      <h2 class="display font-600 mb-2">Responses by HTTP status</h2>
+      <div id="status" class="flex flex-wrap gap-2"></div>
+    </section>
+  </div>
+
+  <p class="text-xs text-muted mt-6">Auto-refreshes every 3s. Raw Prometheus format at <a href="/metrics" class="text-blue hover:underline">/metrics</a>. Cost is estimated from published per-model token pricing.</p>
+</main>
+
+<script>
+const $ = id => document.getElementById(id);
+const fmt = n => (n||0).toLocaleString();
+function statusColor(s){ s=+s; return s<300?'bg-[#dcfce7] text-[#166534]': s<400?'bg-[#dbeafe] text-[#1e40af]': s<500?'bg-[#fef3c7] text-[#92400e]':'bg-[#fee2e2] text-[#991b1b]'; }
+
+async function tick(){
+  try{
+    const m = await (await fetch('/api/metrics.json',{cache:'no-store'})).json();
+    $('t_cost').textContent = '$'+(m.cost_usd||0).toFixed(4);
+    $('t_in').textContent  = fmt(m.input_tokens);
+    $('t_out').textContent = fmt(m.output_tokens);
+    $('t_ans').textContent = fmt(m.llm_answers_total);
+    $('t_req').textContent = fmt(m.requests_total);
+    $('t_rl').textContent  = fmt(m.rate_limited_total);
+
+    // latency table (sorted by p95 desc)
+    const rows = Object.entries(m.latency||{}).sort((a,b)=>b[1].p95_ms-a[1].p95_ms);
+    $('lat').innerHTML = rows.length ? rows.map(([r,v])=>
+      `<tr><td class="font-mono text-[12px]">${r}</td><td>${fmt(v.count)}</td><td>${v.avg_ms} ms</td><td>${v.p50_ms} ms</td><td class="font-600">${v.p95_ms} ms</td></tr>`).join('')
+      : '<tr><td colspan="5" class="text-muted">no requests yet</td></tr>';
+
+    // sources / queue
+    const src=[]; for(const [k,st] of Object.entries(m.sources||{})) for(const [s,n] of Object.entries(st)) src.push([k,s,n]);
+    $('src').innerHTML = src.length ? src.map(([k,s,n])=>{
+      const inflight = !['indexed','failed','skipped'].includes(s);
+      return `<tr><td>${k==='paper'?'📄':k==='deck'?'🖼':'🎞'} ${k}</td><td class="${inflight?'text-orange font-600':s==='indexed'?'text-green':'text-muted'}">${s}${inflight?' ⏳':''}</td><td>${n}</td></tr>`;
+    }).join('') : '<tr><td colspan="3" class="text-muted">no sources</td></tr>';
+
+    // status codes
+    const st = m.by_status||{};
+    $('status').innerHTML = Object.keys(st).length ? Object.entries(st).sort().map(([s,n])=>
+      `<span class="pill ${statusColor(s)}">${s} · ${fmt(n)}</span>`).join('')
+      : '<span class="text-muted text-sm">no requests yet</span>';
+
+    $('updated').textContent = 'updated ' + new Date().toLocaleTimeString();
+    $('updated').className = 'text-xs text-green';
+  }catch(e){
+    $('updated').textContent = 'metrics unreachable';
+    $('updated').className = 'text-xs text-orange';
+  }
+}
+tick(); setInterval(tick, 3000);
+</script>
+</body>
+</html>

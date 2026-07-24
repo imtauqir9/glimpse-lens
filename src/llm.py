@@ -181,6 +181,12 @@ def _answer_openai(cfg: LLMConfig, question: str, moments: list[dict]) -> str:
         temperature=0.2,
         max_tokens=cfg.max_tokens,
     )
+    try:  # real token + cost metering (§18)
+        from . import metrics
+        u = resp.usage
+        metrics.record_tokens(cfg.model, u.prompt_tokens, u.completion_tokens)
+    except Exception:  # noqa: BLE001
+        pass
     return (resp.choices[0].message.content or "").strip()
 
 
@@ -201,4 +207,9 @@ def _answer_anthropic(cfg: LLMConfig, question: str, moments: list[dict]) -> str
         system=SYSTEM,
         messages=[{"role": "user", "content": blocks}],
     )
+    try:  # real token + cost metering (§18)
+        from . import metrics
+        metrics.record_tokens(cfg.model, resp.usage.input_tokens, resp.usage.output_tokens)
+    except Exception:  # noqa: BLE001
+        pass
     return "".join(b.text for b in resp.content if b.type == "text").strip()
