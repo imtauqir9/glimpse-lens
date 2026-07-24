@@ -4,6 +4,10 @@
 
 **🔴 Live:** https://glimpse-lens.fly.dev/ · **Run locally:** `docker compose up` in `app/`
 
+![Glimpse — Multimodal RAG Architecture](glimpse-architecture.png)
+
+*Full design rationale: [`glimpse-design.md`](glimpse-design.md).*
+
 > ⚠️ Every number in the SLA table below must come from a **real** `bench.py` run
 > against the deployment — fill the `[ ]` placeholders after running. Nothing here
 > is fabricated (assignment red-line).
