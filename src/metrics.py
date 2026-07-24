@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import threading
 
+from . import redis_client
+
+_CTR_HASH = "glimpse:ctr"   # Redis hash holding cluster-wide counter totals
+
 _lock = threading.Lock()
 _counters: dict[tuple, float] = {}
 _hsum: dict[tuple, float] = {}
@@ -22,10 +26,30 @@ def _lbl(labels: dict | None) -> tuple:
     return tuple(sorted((labels or {}).items()))
 
 
+def _field(name: str, labels: tuple) -> str:
+    return name + "\x1f" + "&".join(f"{k}={v}" for k, v in labels)
+
+
+def _parse_field(field: str):
+    name, _, lbl = field.partition("\x1f")
+    labels = {}
+    if lbl:
+        for pair in lbl.split("&"):
+            k, _, v = pair.partition("=")
+            labels[k] = v
+    return name, labels
+
+
 def inc(name: str, labels: dict | None = None, value: float = 1.0) -> None:
-    key = (name, _lbl(labels))
+    lab = _lbl(labels)
     with _lock:
-        _counters[key] = _counters.get(key, 0.0) + value
+        _counters[(name, lab)] = _counters.get((name, lab), 0.0) + value
+    r = redis_client.client()   # cluster-wide total (Phase 2)
+    if r is not None:
+        try:
+            r.hincrbyfloat(_CTR_HASH, _field(name, lab), value)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def observe(name: str, seconds: float, labels: dict | None = None) -> None:
@@ -111,14 +135,27 @@ def snapshot() -> dict:
     """JSON-friendly rollup for the dashboard: totals, per-route latency
     percentiles, request status breakdown, token + cost totals."""
     with _lock:
-        counters = {(n, l): v for (n, l), v in _counters.items()}
+        mem = [((n, dict(l)), v) for (n, l), v in _counters.items()]
         hcount = dict(_hcount)
         hsum = dict(_hsum)
         hbucket = {k: dict(v) for k, v in _hbucket.items()}
 
-    def total(name):
-        return sum(v for (n, _), v in counters.items() if n == name)
+    # Counters: cluster-wide from Redis when available, else this replica's.
+    clist = None
+    r = redis_client.client()
+    if r is not None:
+        try:
+            clist = [(_parse_field(f), float(v)) for f, v in r.hgetall(_CTR_HASH).items()]
+        except Exception:  # noqa: BLE001
+            clist = None
+    scope = "cluster (redis)" if clist is not None else "this replica"
+    if clist is None:
+        clist = mem
 
+    def total(name):
+        return sum(v for (n, _), v in clist if n == name)
+
+    # Latency is per-replica (Prometheus aggregates across replicas at scrape).
     latency = {}
     for (name, labels), cnt in hcount.items():
         if name != "glimpse_request_duration_seconds":
@@ -133,12 +170,13 @@ def snapshot() -> dict:
         }
 
     by_status = {}
-    for (name, labels), v in counters.items():
+    for (name, labels), v in clist:
         if name == "glimpse_requests_total":
-            st = str(dict(labels).get("status", "?"))
+            st = str(labels.get("status", "?"))
             by_status[st] = by_status.get(st, 0) + v
 
     return {
+        "scope": scope,
         "requests_total": total("glimpse_requests_total"),
         "llm_answers_total": total("glimpse_llm_answers_total"),
         "rate_limited_total": total("glimpse_rate_limited_total"),
@@ -146,5 +184,6 @@ def snapshot() -> dict:
         "output_tokens": total("glimpse_llm_output_tokens_total"),
         "cost_usd": round(total("glimpse_llm_cost_usd_total"), 4),
         "latency": latency,
+        "latency_scope": "this replica",
         "by_status": by_status,
     }

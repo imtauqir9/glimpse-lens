@@ -45,6 +45,7 @@ services:
     env_file: .env
     environment:
       CLIP_SERVICE_URL: ${CLIP_SERVICE_URL:-http://clip:8001}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}   # cluster-wide rate-limit + metrics
     volumes:
       - ./data:/app/data          # STORAGE_PROVIDER=local only (dev)
       - hf_cache:/root/.cache
@@ -65,6 +66,7 @@ services:
       # With the clip service doing the embedding, each run is light
       # (download + ffmpeg only) — raise this without adding RAM for models.
       WORKER_CONCURRENCY: 2
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
     volumes:
       - ./data:/app/data
       - hf_cache:/root/.cache
@@ -76,6 +78,11 @@ services:
     restart: unless-stopped
     # Need more throughput? Replicas multiply it (all share the one clip model):
     # docker compose up -d --scale worker=3   (-> 6 videos at once)
+
+  # Cluster-wide state for rate limiting + metrics counters (Phase 2).
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
 
 volumes:
   hf_cache:

@@ -13,6 +13,8 @@ import threading
 import time
 from collections import defaultdict, deque
 
+from . import redis_client
+
 # Env-tunable knobs.
 RATE_MAX = int(os.getenv("RATE_LIMIT_PER_MIN", "30"))      # requests / minute / user
 RATE_WINDOW = 60.0
@@ -36,6 +38,25 @@ def check_rate(user_id: str) -> None:
     caller can never dodge the limit (or tenant isolation) by omitting it."""
     if not user_id:
         raise RateLimited(retry_after=RATE_WINDOW)
+
+    # Cluster-wide limit via Redis (correct across replicas) — fixed window.
+    r = redis_client.client()
+    if r is not None:
+        try:
+            bucket = int(time.time() // RATE_WINDOW)
+            key = f"rl:{user_id}:{bucket}"
+            n = r.incr(key)
+            if n == 1:
+                r.expire(key, int(RATE_WINDOW) + 1)
+            if n > RATE_MAX:
+                raise RateLimited(retry_after=RATE_WINDOW - (time.time() % RATE_WINDOW))
+            return
+        except RateLimited:
+            raise
+        except Exception:  # noqa: BLE001 — a Redis blip degrades to in-memory
+            pass
+
+    # In-memory fallback (single replica / no Redis): sliding window.
     now = time.monotonic()
     with _lock:
         dq = _hits[user_id]
