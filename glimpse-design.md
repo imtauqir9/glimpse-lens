@@ -73,7 +73,8 @@ Browser: cited answer + timestamps + thumbnails
 | Component | Choice | Role |
 |-----------|--------|------|
 | Object storage | GCS / S3 / Tigris | Source media (videos, PDFs, decks) + thumbnails/clips |
-| Metadata DB | Postgres (Neon) | Source manifest, ingest status/lifecycle |
+| Metadata DB | Postgres (Neon) | Source manifest, ingest status/lifecycle, API keys (`ms_api_keys`), audit trail (`ms_audit`) |
+| Shared state | Redis (Upstash) | Cluster-wide rate-limit + metrics counters. Optional: no `REDIS_URL` → per-process fallback, correct only at one replica |
 | Vector DB | Qdrant | Unified index; **scalar quantization** (int8 in RAM + float32 on disk); HNSW; multi-tenant |
 | Queue | Job queue (managed or self-hosted) / Prefect | Background ingest jobs, status, retries |
 | Compute | Containers + autoscaling workers | CLIP service, ingest workers, API |
@@ -160,6 +161,19 @@ You can't operate — or prove Task 3.3's "nothing is lost" — without measurem
 - SLO: query p95 < target, held **even during a backfill** (this is the decoupling proof, made visible).
 - Alerts: queue depth climbing (workers falling behind), DLQ non-empty (poison docs), recall regression, error-rate spike, worker crash-loop.
 
+### What's built, and where the state lives
+
+Two surfaces over one metrics store: `GET /metrics` (Prometheus text) and `GET /api/metrics.json` (JSON rollup behind `/dashboard`). Both are admin-gated. Ingest queue-depth gauges are computed from Postgres at scrape time rather than kept as counters, so they can't drift from reality.
+
+**Counters are cluster-wide; histograms are per-replica.** This asymmetry is deliberate and worth stating, because it decides what you may trust:
+
+- *Counters* (requests, rate-limited, tokens, `$` cost) write through to a Redis hash, and **both** readers prefer it. So the two endpoints can never disagree, and totals survive a machine restart — which matters more than it sounds: the api process auto-stops when idle (`min_machines_running = 0`), so in-process counters would reset on **every idle cycle**, and Prometheus would record a counter reset. Sawtooth graphs, and `rate()`-based alerts evaluating a window that just dropped to zero.
+- *Histograms* (latency buckets) remain in-process and **do** reset when a machine stops. Normally Prometheus aggregates per-replica histograms across instances at scrape time, which is the standard answer — but that assumes instances stay up. With idle-stop machines, p95 is only meaningful within a single machine's uptime. Fixing it properly needs Redis-backed buckets.
+
+The gap this closes is a specific failure worth remembering: shared state added on the **write** path is not enough. Until both read paths used it, `/api/metrics.json` reported 53 requests while `/metrics` reported 18 **at the same instant** — and it was the Prometheus endpoint, the one the monitoring stack actually scrapes, that was wrong.
+
+**Prometheus deployment:** the `monitoring/` stack (Prometheus + Grafana + alert rules) runs as containers scraping the deployed app over TLS, not as an app process group — a per-app time-series database wants a persistent volume and is the wrong thing to pay for at this size. Fly's managed Prometheus is the alternative, with one catch: its scraper sends no `Authorization` header, so it cannot read an admin-gated `/metrics` without that route being opened first.
+
 ## 11. Guardrails
 
 Guardrails protect quality, cost, and safety — critical here because the pipeline ingests **untrusted documents** and answers with an LLM.
@@ -167,8 +181,25 @@ Guardrails protect quality, cost, and safety — critical here because the pipel
 - **Input validation (ingest):** allowed file types + size caps, page/duration limits, MIME sniffing, scan on upload; reject or quarantine malformed files (→ dead-letter, surfaced in status).
 - **Prompt-injection defense (critical):** retrieved document text is **data, not instructions**. A malicious PDF/slide may contain "ignore previous instructions…". Mitigate by clearly delimiting retrieved context, instructing the LLM to treat it as quoted evidence only, never letting retrieved text alter system/tool behavior, and escaping instruction-like patterns. Assume ingested content is hostile.
 - **Grounding / faithfulness:** every answer cites retrieved evidence with an exact locator; **no citation → not shown**. Optionally verify the answer is *supported* by the retrieved passages and abstain ("couldn't find this") rather than hallucinate.
-- **Abuse & fairness:** per-user rate limiting + fair queue (no tenant starves others), plan quotas, and hard cost caps on LLM calls.
-- **Tenant isolation:** every query carries the `user_id` payload filter — **fail closed** if it's ever missing; no cross-tenant retrieval.
+- **Abuse & fairness:** per-user rate limiting + fair queue (no tenant starves others), plan quotas, and hard cost caps on LLM calls. *Built:* `RATE_LIMIT_PER_MIN` per user/minute, counted in Redis so the limit is a **cluster** limit — with per-process counters, N replicas would silently allow N × the limit. No Redis → in-memory fallback, correct for one replica.
+- **Tenant isolation:** every query carries the `user_id` payload filter — **fail closed** if it's ever missing; no cross-tenant retrieval. **What establishes `user_id` matters as much as the filter:** it comes from the API key, not from a client-supplied `X-User-Id` header. A header is caller-controlled, so header-derived tenancy is bypassable by editing a request — the filter would be enforced perfectly against the wrong tenant. `X-User-Id` is honored *only* when auth is inactive (local dev). See **Authentication & RBAC** below.
+
+### Authentication & RBAC (implemented)
+
+Bearer keys shaped `glk_…`, stored as **SHA-256 hashes** in `ms_api_keys` — a database leak yields no usable key. Each key maps to a `user_id` (tenant) and a role:
+
+| Role | Can |
+|---|---|
+| `viewer` | search + ask; read own tenant's sources |
+| `admin` | the above, plus ingest, delete, mint/revoke keys, read metrics |
+
+- **Fail-open by design, and that is a deployment hazard.** Auth activates only once `ADMIN_TOKEN` is set **or** at least one key exists. This keeps `docker compose up` zero-config, but on a public URL an unset token means every route is open, `/admin/*` included. Setting it is a required deploy step, not a hardening option.
+- **`ADMIN_TOKEN` is the bootstrap**, doubling as a master admin key — used once to mint real per-tenant keys. It should not be the credential in day-to-day use: it can't be revoked without rotating the secret and redeploying, whereas a `glk_` key is revocable through the API.
+- **401 vs 403 are distinct signals:** 401 = identity not established; 403 = identity established, role insufficient. A viewer hitting `/metrics` gets 403.
+
+### Audit log (implemented)
+
+Every mutating action — ingest, delete, retry, key mint — appends to `ms_audit`: actor `user_id` + role, action, target, source IP, metadata, server timestamp. Append-only; the application exposes no update or delete path. This is the compliance and security-review trail, and it is what makes "who deleted this tenant's source?" answerable after the fact.
 - **PII & compliance:** flag/redact PII in transcripts and documents where required; honor deletion across object storage, Postgres, **and** Qdrant together.
 
 ## 12. Retrieval Enhancements — Hybrid Search & Reranking
@@ -248,6 +279,8 @@ Multimodal LLM calls (especially with image frames) and embedding dominate cost 
 - **Budgets & caps:** per-query and per-tenant/plan cost ceilings; the agentic path (§17) gets a hard token budget + iteration cap.
 - **Cost levers:** semantic-cache hits (§13) skip the LLM entirely; retrieve/rerank to a *small* top-K so fewer tokens reach the LLM; send frames as compact thumbnails, not full images; use a cheap model for planning/judging and the strong model only for final synthesis; batch embeddings.
 - **Dashboards & alerts:** cost per query, cost per tenant, % served from cache, token-spend trend — alert on anomalies (a runaway agent, a spend spike).
+
+**Built:** actual usage is read from the provider response (not estimated from string length) and metered as `glimpse_llm_{input,output}_tokens_total` and `glimpse_llm_cost_usd_total`, labelled by model, priced from a per-model table. A live answer on `claude-opus-4-8` metered 1514 in / 176 out = **$0.012**. The `LLMCostSpike` alert fires above $5/hour. Two gaps against the design above: cost is not yet broken down *per tenant* (the counters carry a `model` label, not a `user_id` one), and the budgets/caps are alert-only — nothing hard-stops a runaway spend yet.
 
 ## 19. Forward-Deployed-Engineer Considerations (Task 3.4)
 
@@ -379,7 +412,8 @@ curl -sf https://<your-app>.fly.dev/ >/dev/null && echo "deployed ok"   # 8
 
 ## 6. Bonus — where your extra design lives (do NOT let these block the core)
 - 🚀 **Own broker** (Redis Streams / RabbitMQ / **Kafka**) with at-least-once + DLQ = the assignment's explicit stretch goal → *your Kafka build already does this.*
-- Your **GraphRAG (§16), Agentic RAG (§17), Semantic cache (§13), Cost panel (§18), Feedback (§15), Observability (§10)** are all beyond scope / map to stretch ("more modalities," "cost panel"). Great north-star; not graded core.
+- Your **GraphRAG (§16), Agentic RAG (§17), Semantic cache (§13), Feedback (§15)** are all beyond scope / map to stretch ("more modalities," "cost panel"). Great north-star; not graded core.
+- **Built since this list was written** — no longer north-star, now deployed and verified in production: **Observability (§10)** — `/metrics` + `/dashboard`, Prometheus + Grafana + four alert rules; **Cost panel (§18)** — real token/`$` metering per model, measured at $0.012 on a live `claude-opus-4-8` answer; and **Auth, RBAC + audit log (§11)**, which weren't on this list at all.
 
 ---
 
