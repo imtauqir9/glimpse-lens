@@ -130,6 +130,20 @@ set. Confirm after deploy — the api logs print one line at first use:
 If you see `[redis] unavailable (…) — using in-memory fallback` instead, the app
 is still up and serving; it just isn't multi-replica-correct. Fix the URL.
 
+> Fly's Upstash instance answers the **first** PING in ~1.4s even in the same
+> region (later ops are single-digit ms). `REDIS_TIMEOUT_S` defaults to 5s to
+> absorb that; below ~2s the handshake times out and every machine silently runs
+> on the in-memory fallback while looking correctly configured. A failed connect
+> retries once per `REDIS_RETRY_COOLDOWN_S` (default 30s) rather than latching
+> off for the life of the process.
+
+Prove it's actually being used, not merely reachable — the rate limiter writes
+`rl:<tenant>:<minute>` and metrics write the `glimpse:ctr` hash:
+
+```powershell
+fly ssh console --process-group worker -C "python -c ""import os,redis; c=redis.Redis.from_url(os.environ['REDIS_URL'],socket_timeout=5,decode_responses=True); print(list(c.scan_iter(count=100)))"""
+```
+
 ### 3b. Turn on auth (and mint the first key)
 
 Auth **fails open by design**: `src/auth.py` enforces keys only once an
