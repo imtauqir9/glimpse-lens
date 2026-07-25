@@ -68,6 +68,56 @@ Multimodal LLM (GPT-4o / vLLM / others)  — reason over answer + evidence
 Browser: cited answer + timestamps + thumbnails
 ```
 
+### 3.3 The flow as implemented
+
+3.1 and 3.2 are the intent. This is what actually runs, step by step, with the code that does it.
+
+**Process topology.** One Docker image, three long-running process groups plus a one-shot seed gate:
+
+```
+                    ┌─ api    :8000  public    routes · auth · retrieval · UI
+one image ──────────┼─ worker  no ports        polls Prefect, runs ingest
+                    └─ clip   :8001 internal   ONE warm CLIP model (binds ::)
+                              │
+   Neon Postgres · Qdrant Cloud · Prefect Cloud · GCS/Tigris · Upstash Redis
+```
+
+Everything stateful is a rented managed service, so every machine is disposable. `clip` binds `::` rather than `0.0.0.0` because Fly private networking is IPv6-only — bound to `0.0.0.0` it is unreachable at `clip.process.<app>.internal`.
+
+**Write path — ingest**
+
+1. `POST /api/videos/presign` (`api/videos.py`) returns a presigned PUT URL.
+2. The client uploads bytes **directly to object storage**, never through the API. (`PUT /{id}/content` is the fallback when the bucket can't presign.)
+3. `POST /api/videos` writes a `pending` row, schedules a Prefect run, and returns **202 in single-digit ms**. Papers and decks take the same shape via `POST /admin/documents`. Both append to `ms_audit`.
+4. The **dispatcher** (`dispatcher.py`) admits pending sources round-robin across users — a weighted-fair queue, so one bulk uploader cannot starve everyone else.
+5. The **worker** (`worker.py`) long-polls Prefect Cloud — **outbound HTTPS only, no inbound ports** — running up to `WORKER_CONCURRENCY` flows concurrently.
+6. Pipeline stages, each a Prefect task carrying its own retry policy (`ingest/pipeline.py`):
+
+   | Task | Retries | Does |
+   |---|---|---|
+   | `t_fetch` | 2 @ 30s, 120s | download source |
+   | `t_sample` | — | ffmpeg → frames |
+   | `t_embed_index` | 2 @ 60s | CLIP embed → Qdrant upsert |
+   | `t_transcript` | 1 @ 30s | transcript chunks → text embed → text collection |
+
+   Embedding goes to the warm `clip` service; with `CLIP_SERVICE_URL` unset each run loads the model in-process, which is the ~15–30s penalty the service exists to pay once.
+7. The **reconciler** (`reconciler.py`, started in the api lifespan) re-enqueues sources stranded by a worker crash. Retries are idempotent, so redelivery is always safe.
+
+**Read path — `POST /api/ask`**
+
+1. **Middleware** (`app.py`) — correlation id, timing, request counter + duration histogram. High-cardinality media paths collapse to `/api/media` so label cardinality stays bounded.
+2. **Auth** — the key resolves to `(user_id, role)`; **the key sets the tenant** (§11).
+3. **Rate limit** (`guardrails.check_rate`) — Redis fixed window keyed `rl:<tenant>:<minute>`, falling back to an in-memory sliding window. Over limit → 429 + `Retry-After`. An empty `user_id` is rejected outright, so the limit can't be dodged by omitting the tenant.
+4. **Two retrieval branches** (`rag/search.py`), both carrying the `user_id` filter: visual (CLIP text→image over frames) and text (bge query→transcript chunks). **Papers and decks live in the same text collection**, which is why cross-source citations work at all.
+5. **Fusion** (`_fuse`) — RRF into time windows. Documents bucket by *locator* rather than time, so two pages of one paper stay two windows instead of collapsing into one.
+6. **Gate 1 — confidence**, scored on the **raw per-branch bests**, not the fused score: abstain only if *neither* what's on screen nor what's said looks relevant. This runs **before** the LLM call, so an unanswerable question costs nothing.
+7. **Model resolution** — the tenant's own hosted model if configured, else the server's; with neither, `_fallback_answer` summarizes the matches rather than inventing prose.
+8. **Synthesis** → citation validation → token/`$` metered from the provider's reported usage (§18).
+
+`POST /api/retrieve` is this path minus steps 7–8. That split is deliberate: it is embed + ANN in milliseconds, so it measures the **decoupling SLA honestly** — the SLA is about retrieval, not the seconds-long multimodal LLM call, and folding the LLM into the measurement would hide the property being proven.
+
+**Why the paths don't contend.** The API only ever writes a row and schedules a run. No request ever waits on parsing, embedding, or an LLM call triggered by someone else's upload. That is the whole reason a thousand-video backfill and a user's query can run at once without the query noticing — the claim §9 makes and `benchmark/bench.py` tests.
+
 ## 4. Data & Infrastructure
 
 | Component | Choice | Role |
