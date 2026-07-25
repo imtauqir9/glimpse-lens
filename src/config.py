@@ -117,7 +117,7 @@ VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
                   "indexed", "skipped", "failed")
 # Document (paper/deck) stages, mirroring the video lifecycle — they share the
 # ms_videos table and the same worker pool (src/ingest/flows.py).
-DOCUMENT_STAGE_STATUSES = ("parsing", "chunking")
+DOCUMENT_STAGE_STATUSES = ("parsing", "enriching", "chunking")
 # In-flight = occupying execution capacity (scheduled or running). Document
 # stages count too: a worker slot busy parsing a PDF is a slot the video
 # dispatcher must not hand out again.
@@ -133,6 +133,25 @@ RUNNING_STATUSES = ("fetching", "sampling", "embedding", *DOCUMENT_STAGE_STATUSE
 # dispatcher admits them round-robin ACROSS users, keeping only
 # DISPATCH_MAX_INFLIGHT running at once — so the waiting line is fairly ordered
 # in OUR DB, not FIFO inside Prefect. No user can starve the others.
+# Dead-letter (design §7, §20). Prefect's per-task retries are bounded, but the
+# reconciler re-enqueues stranded sources forever — so a document that KILLS its
+# worker (OOM on a pathological PDF) never gets to set `failed`, and comes back
+# every sweep for good. `attempts` was already counted on every run and only ever
+# printed; this is the cap that makes it mean something. Past it the source is
+# parked at `failed` with a dead-letter reason and stops consuming capacity.
+MAX_INGEST_ATTEMPTS = _int("MAX_INGEST_ATTEMPTS", 5)
+
+# --- Enrichment (image-only pages / slides) ------------------------------------
+# The `enrich` stage of 3.1's parse → chunk → enrich → embed. A page or slide with
+# no extractable text is rendered and captioned by the multimodal LLM, so a figure
+# or a chart is findable by what it SHOWS. Capped because each caption is an LLM
+# call on the ingest path: a 200-page scanned PDF would otherwise be 200 of them.
+# Beyond the cap, remaining image-only pages index on their sparse text alone.
+ENRICH_CAPTIONS = _envbool("ENRICH_CAPTIONS", True)
+MAX_CAPTIONED_PAGES = _int("MAX_CAPTIONED_PAGES", 12)
+CAPTION_WORKERS = _int("CAPTION_WORKERS", 4)   # captions run concurrently
+CAPTION_RENDER_DPI = _int("CAPTION_RENDER_DPI", 120)
+
 ENABLE_FAIR_DISPATCH = _envbool("ENABLE_FAIR_DISPATCH", True)
 # Max videos executing at once. Set to your total capacity:
 # (worker machines) x WORKER_CONCURRENCY — anything above that would just pile

@@ -7,8 +7,10 @@ python-pptx) — it just asks Prefect Cloud to schedule the right deployment.
 
 The two deployments (`ms-ingest-paper/ingest`, `ms-ingest-deck/ingest`) are
 registered by worker.py's flow.serve() — see WIRING.md step 3. Until they exist,
-this raises at schedule time and /admin/documents returns 502 (upstream), which
-is the correct behavior to surface.
+this raises at schedule time. That raise happens in a BackgroundTask, after the
+202 has been sent, so it does NOT become a 502 — the caller sees the accepted
+row go to `status:"failed"` with the reason, via GET /admin/sources. See the
+admin.py header for why async accept wins that trade.
 """
 from __future__ import annotations
 

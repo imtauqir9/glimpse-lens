@@ -23,7 +23,8 @@ a deck slide — each deep-linked to the exact locator.
 
 | Area | File(s) | What it does |
 |---|---|---|
-| Paper ingest | `src/ingest/paper.py` | PDF → per-page text → page-aware chunks; locator = **page** |
+| Paper ingest | `src/ingest/paper.py` | PDF → per-page text → page-aware chunks; locator = **page**. Pages with no extractable text (figures, charts, scans) are rendered and captioned rather than dropped |
+| Enrich | `src/ingest/paper.py` (`enrich_pages`) | The `enrich` verb of 3.1, shared by both source types: rendered pages/slides → multimodal-LLM captions, run concurrently, capped by `MAX_CAPTIONED_PAGES`. Its own Prefect task, so a rate-limited caption retries without re-parsing |
 | Deck ingest | `src/ingest/deck.py` | PDF and PPTX → per-slide text; locator = **slide**. Vision-LLM captioning of image-only slides works for **PDF decks only** — see the caveat in §6 |
 | Prefect flows | `src/ingest/flows.py` | `ingest_paper_flow` / `ingest_deck_flow`, per-stage `@task`s mirroring the video pipeline (a failed stage retries without redoing finished ones) |
 | Queue trigger | `src/jobs_documents.py` | schedules the flows (fire-and-forget, like `jobs.enqueue_video`) |
@@ -142,7 +143,16 @@ to `indexed`. This passes because ingest is:
    re-run overwrites instead of duplicating.
 3. **Per-stage retries** — a rate-limited embed retries just that task; parse/chunk
    results are reused, not recomputed.
-4. **Reconciler (redelivery)** — the first `--resilience` run *failed* (0/4): a
+4. **Dead-letter (attempt cap)** — the counterpart to redelivery, and it was
+   missing: `attempts` was incremented on every run and its value only ever
+   *printed*. A document that *raises* is fine — its flow marks it `failed`,
+   terminal. The dangerous case is one that **kills its worker** (an OOM on a
+   pathological PDF is not an exception), because nothing marks it failed and
+   the reconciler below re-enqueues it forever, killing each worker in turn.
+   `MAX_INGEST_ATTEMPTS` now parks it at `failed` with a dead-letter reason;
+   `attempts` is exposed on `/admin/sources` so a poison document is visible as
+   one rather than as a blip.
+5. **Reconciler (redelivery)** — the first `--resilience` run *failed* (0/4): a
    SIGKILL isn't an exception, so Prefect marks the run "Crashed" and never
    reschedules it — idempotency makes re-running safe but nothing *re-triggered*
    it. Added `src/reconciler.py`, an always-up sweep in the API that re-enqueues
@@ -161,6 +171,14 @@ to `indexed`. This passes because ingest is:
   Kafka with at-least-once + DLQ — is the stretch goal, not the core.)
 - **Grounded citations everywhere** — every answer cites a locator; no citation → not
   shown. Trust is the product.
+- **Resilience, stated precisely** (design §19 now carries the same table):
+  idempotency, retries, redelivery, dead-letter and health checks are built;
+  backpressure is partial (the fair dispatcher caps in-flight *videos*; documents
+  skip it); **graceful SIGTERM is not built** — there is no signal handling in
+  `src/`. A killed worker's in-flight run is recovered by the reconciler instead
+  of drained on the way out. That is the weaker guarantee — the in-flight work is
+  redone rather than finished — but it is the one `bench.py --resilience`
+  actually exercises, and 4/4 recovered.
 - **Cost control** — one shared text embedder, int8 memory, text-hash dedup on paper
   chunks, rescore-only-on-shortlist.
 - **Eats a real backfill** — size caps + best-effort captioning + dead-letter on

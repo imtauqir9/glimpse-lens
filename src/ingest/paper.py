@@ -4,7 +4,7 @@ src/ingest/paper.py — Paper (PDF) ingestion.
 Mirrors the PROVIDED video flow (src/ingest/pipeline.py :: ingest_video), but the
 source is a PDF paper and the citation locator is a **page** number:
 
-    fetch → parse → chunk (page-aware) → embed → index
+    fetch → parse → enrich (caption figures) → chunk (page-aware) → embed → index
 
 Reconciled to the REAL momentsearch repo (not the design-doc's guessed names):
   • Papers are TEXT, so they ride the repo's *text branch* — the same one the
@@ -36,12 +36,13 @@ import ipaddress
 import socket
 import urllib.parse
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 
 import fitz  # PyMuPDF  (pip install pymupdf)
 
 # --- shared repo pieces (REAL names, reconciled against momentsearch/src) ------
-from .. import config, db, storage               # db.set_status / storage.get_bytes
+from .. import config, db, llm, storage          # db.set_status / storage.get_bytes
 from ..config import TEXT_EMBED_VERSION          # version tag carried in the payload
 from ..rag import vector_store                   # ensure_text_collection / upsert_chunks / delete_video
 from ..rag.embeddings import embed_docs          # text (bge / OpenAI) embeddings
@@ -57,10 +58,14 @@ MAX_FETCH_MB = 64            # reject oversized PDFs at the door (design §11 gu
 MAX_PAGES = 2000            # page cap on untrusted PDFs — bounds cost + blocks abuse (§11)
 
 
+MIN_TEXT_CHARS = 24         # below this a page is treated as image-only (→ enrich)
+
+
 @dataclass
 class PageText:
     page: int          # 1-based page number == the citation locator
     text: str
+    image: bytes | None = None   # rendered PNG, set only when the page needs a caption
 
 
 @dataclass
@@ -146,22 +151,88 @@ def _load_bytes(uri: str, storage_key: str | None) -> bytes:
 def parse_paper(data: bytes) -> list[PageText]:
     """PDF bytes → per-page text, preserving 1-based page numbers (the locator).
 
-    Image-only pages yield no extractable text and are skipped here. If figure
-    retrieval matters, render + caption those pages the way `deck.py` captions
-    image-only slides and re-add them.
+    A page with (almost) no extractable text is a figure, a chart or a scan — the
+    content most worth finding and the content a text extractor sees as blank.
+    Dropping those pages, as this used to, silently made them unsearchable. They
+    are now RENDERED here and captioned in the enrich stage, up to
+    MAX_CAPTIONED_PAGES, so a reader can ask about a diagram and land on it.
+
+    Rendering (cheap, local) happens here; captioning (an LLM call, flaky) is a
+    separate stage with its own retry policy — that split is the whole reason the
+    pipeline is per-stage tasks.
     """
     pages: list[PageText] = []
+    rendered = 0
     with fitz.open(stream=data, filetype="pdf") as doc:
         if doc.page_count > MAX_PAGES:     # §11: reject abusive/oversized documents
             raise ValueError(f"PDF has {doc.page_count} pages; the limit is {MAX_PAGES}.")
         for i, page in enumerate(doc, start=1):
             text = page.get_text("text").strip()
-            if text:                       # skip blank / image-only pages here
-                pages.append(PageText(page=i, text=text))
+            image = None
+            if len(text) < MIN_TEXT_CHARS:
+                if not config.ENRICH_CAPTIONS or rendered >= config.MAX_CAPTIONED_PAGES:
+                    if not text:
+                        continue           # nothing to index and no budget to caption
+                else:
+                    image = page.get_pixmap(dpi=config.CAPTION_RENDER_DPI).tobytes("png")
+                    rendered += 1
+            pages.append(PageText(page=i, text=text, image=image))
     return pages
 
 
-# 2) CHUNK (page-aware) ────────────────────────────────────────────────────────
+# 2) ENRICH (caption rendered image-only pages/slides) ─────────────────────────
+# Lives here rather than in deck.py because deck.py already imports from this
+# module — putting it the other way round would be a circular import.
+
+_CAPTION_PROMPT = ("Describe this page in one or two sentences for search: its "
+                   "title, key text, and any chart, diagram or figure shown.")
+
+
+def caption_image(png: bytes) -> str:
+    """Caption a rendered page/slide with the repo's multimodal LLM.
+
+    The repo exposes `llm.answer(question, moments, cfg)` rather than a standalone
+    captioner, where a moment is {"image", "transcript", "timestamp"} — so this
+    wraps it with a single-image moment.
+
+    Best-effort by design: no LLM configured, or a failed call, returns "" and the
+    page indexes on whatever text it has. Enrichment improves recall; it must
+    never be the reason an ingest fails (same stance as the transcript branch).
+    """
+    cfg = llm.env_config()
+    if cfg is None:
+        return ""
+    try:
+        return llm.answer(_CAPTION_PROMPT,
+                          [{"image": png, "transcript": None, "timestamp": "page"}],
+                          cfg).strip()
+    except Exception as exc:  # noqa: BLE001
+        print(f"[enrich] caption failed ({type(exc).__name__}: {exc}) — text-only")
+        return ""
+
+
+def enrich_pages(pages: list) -> list:
+    """Fold a caption into the text of every page/slide that carries a render.
+
+    Concurrent because captions are independent network calls: serially, a deck
+    with 12 image slides is 12 round-trips end to end, which lands squarely in
+    the ingest wall-clock the throughput SLA divides by. Works on both PageText
+    and Slide — they share the `.text` / `.image` shape.
+    """
+    targets = [p for p in pages if getattr(p, "image", None)]
+    if not targets:
+        return pages
+    workers = max(1, min(config.CAPTION_WORKERS, len(targets)))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        captions = list(ex.map(lambda p: caption_image(p.image), targets))
+    for page, caption in zip(targets, captions):
+        if caption:
+            page.text = f"{page.text}\n{caption}".strip()
+        page.image = None        # drop the bytes once used — don't carry them on
+    return pages
+
+
+# 3) CHUNK (page-aware) ────────────────────────────────────────────────────────
 def _window_chunks(text: str, size: int = CHUNK_WORDS,
                    overlap: int = CHUNK_OVERLAP) -> list[str]:
     """Sliding word-window splitter — the repo's generic text chunker stand-in.
@@ -220,68 +291,8 @@ def chunk_paper(source_id: str, title: str, pages: list[PageText],
     return chunks
 
 
-# 3) FLOW: fetch → parse → chunk → embed → index ──────────────────────────────
-def ingest_paper(source_id: str, uri: str, title: str,
-                 user_id: str, storage_key: str | None = None) -> int:
-    """
-    The paper flow body. Status lifecycle mirrors ingest_video:
-        pending → parsing → chunking → embedding → indexed | failed
-
-    CRASH-SAFETY: set `indexed` ONLY after the Qdrant upsert returns. If the
-    worker dies mid-run the source stays un-`indexed`, the queue redelivers it,
-    and `upsert_chunks`' deterministic uuid5 ids (from source_id + index) mean
-    re-running overwrites the same points instead of duplicating. `delete_video`
-    first clears any partial points a crashed prior attempt left behind.
-
-    Returns the number of chunks indexed.
-    """
-    db.bump_attempts(source_id)   # mirrors ingest_video's attempt counter
-    try:
-        db.set_status(source_id, "parsing")
-        data = _load_bytes(uri, storage_key)
-        pages = parse_paper(data)
-
-        db.set_status(source_id, "chunking")
-        chunks = chunk_paper(source_id, title, pages, user_id)
-        if not chunks:
-            db.set_status(source_id, "indexed", frame_count=0, progress=1.0)
-            return 0
-
-        db.set_status(source_id, "embedding", progress=0.0)
-        vectors = embed_docs([c.text for c in chunks])
-
-        vector_store.ensure_text_collection()
-        vector_store.delete_video(user_id, source_id)   # idempotent re-run: drop stale points
-        vector_store.upsert_chunks(
-            user_id, source_id, vectors,
-            payloads=[c.payload for c in chunks],
-        )
-        db.set_status(source_id, "indexed",             # ← only AFTER a successful write
-                      frame_count=len(chunks),
-                      embed_version=TEXT_EMBED_VERSION, progress=1.0)
-        return len(chunks)
-    except Exception as exc:                             # noqa: BLE001
-        db.set_status(source_id, "failed", error=f"{type(exc).__name__}: {exc}")
-        raise                                           # let Prefect apply its retry policy
-
-
-# ── Prefect wiring (register alongside the video deployment) ──────────────────
-# The video pipeline is a Prefect flow ("ms-ingest-video", served by worker.py,
-# scheduled by jobs.enqueue_video via run_deployment). Add a paper branch that
-# mirrors it — same per-task retries. Sketch (ADAPT to src/jobs.py + worker.py):
-#
-#   from prefect import flow, task
-#
-#   @task(name="paper-parse", retries=2, retry_delay_seconds=[30, 120])
-#   def _parse(source_id, uri, storage_key):
-#       return parse_paper(_load_bytes(uri, storage_key))
-#   # …one @task per stage so a failed stage retries without redoing the rest…
-#
-#   @flow(name="ms-ingest-paper", log_prints=True, timeout_seconds=3600)
-#   def ingest_paper_flow(source_id: str, uri: str, title: str, user_id: str,
-#                         storage_key: str | None = None):
-#       ingest_paper(source_id, uri, title, user_id, storage_key)
-#
-# Register the deployment in worker.py (flow.serve) and add an enqueue helper in
-# jobs.py mirroring enqueue_video; POST /admin/documents schedules it for
-# kind="paper".
+# The FLOW lives in src/ingest/flows.py (`ms-ingest-paper`), as per-stage
+# Prefect tasks: fetch+parse -> enrich -> chunk -> embed+index, each with its
+# own retry policy so a rate-limited caption or embed does not re-download and
+# re-parse the PDF. This module owns the STAGES; the flow owns their
+# orchestration and the status lifecycle.

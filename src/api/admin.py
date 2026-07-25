@@ -12,7 +12,16 @@ README; the base repo itself uses /api/videos and has no /admin/*):
   POST /admin/documents   -> 202 {id, status:"pending", kind}
   GET  /admin/sources     -> unified video + document list with kind + pct
 
-Errors: 400 bad input · 401 bad/missing admin token · 502 upstream (scheduling).
+Errors: 400 bad input · 401 bad/missing admin token · 403 wrong role.
+
+No 502 on this route, deliberately. Scheduling the Prefect run is an upstream
+call, but it happens in a BackgroundTask AFTER the 202 is on the wire — that is
+what keeps accept p95 at ~170ms instead of ~700ms. A response already sent cannot
+become a 502, so an upstream scheduling failure surfaces as `status:"failed"` with
+the reason on the row, visible via GET /admin/sources. Returning 202-before-
+scheduling and a synchronous 502 for the same call are mutually exclusive; this
+picks the async accept, because that is the decoupling property the whole design
+rests on.
 
 Auth + tenant scoping reuse the exact pattern from videos.py (Bearer ADMIN_TOKEN,
 X-User-Id header).

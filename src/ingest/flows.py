@@ -37,10 +37,29 @@ from src.rag.embeddings import embed_docs
 from src.ingest import deck as deck_mod
 from src.ingest import paper as paper_mod
 
-# Retry policy mirrors the video flow: the flaky I/O stages (download, embed)
-# retry; pure-CPU chunking does not need to.
+# Retry policy mirrors the video flow: the flaky I/O stages (download, caption,
+# embed) retry; pure-CPU chunking does not need to.
 _FETCH_RETRY = dict(retries=2, retry_delay_seconds=[30, 120])
+_ENRICH_RETRY = dict(retries=1, retry_delay_seconds=30)
 _EMBED_RETRY = dict(retries=2, retry_delay_seconds=60)
+
+
+# ── Shared enrich: caption the rendered image-only pages/slides ───────────────
+@task(name="enrich", **_ENRICH_RETRY)
+def _enrich(source_id: str, items: list) -> list:
+    """The `enrich` stage of parse → chunk → enrich → embed.
+
+    Parse rendered every page/slide that had no extractable text; this turns each
+    render into a caption via the multimodal LLM, so a figure or a chart is
+    findable by what it SHOWS rather than being invisible to a text index.
+
+    Its own task because captioning is the flakiest step in the flow — a rate
+    limit here retries just the captions, leaving the parsed pages intact.
+    Best-effort inside (paper.caption_image swallows per-image failures), so a
+    dead LLM degrades the document to text-only instead of failing the ingest.
+    """
+    db.set_status(source_id, "enriching")
+    return paper_mod.enrich_pages(items)
 
 
 # ── Shared tail: embed → index (identical for paper and deck) ─────────────────
@@ -91,6 +110,7 @@ def ingest_paper_flow(source_id: str, uri: str, title: str, user_id: str,
     db.bump_attempts(source_id)
     try:
         pages = _paper_parse(source_id, uri, storage_key)
+        pages = _enrich(source_id, pages)
         chunks = _paper_chunk(source_id, title, pages, user_id)
         n = _embed_index(source_id, user_id, chunks)
         print(f"[ingest_paper] {source_id} indexed {n} chunks")
@@ -121,6 +141,7 @@ def ingest_deck_flow(source_id: str, uri: str, title: str, user_id: str,
     db.bump_attempts(source_id)
     try:
         slides = _deck_parse(source_id, uri, storage_key, filename or uri)
+        slides = _enrich(source_id, slides)
         chunks = _deck_chunk(source_id, title, slides, user_id)
         n = _embed_index(source_id, user_id, chunks)
         print(f"[ingest_deck] {source_id} indexed {n} chunks")
@@ -143,6 +164,6 @@ def ingest_deck_flow(source_id: str, uri: str, title: str, user_id: str,
 #       # ...plus the existing video deployment...
 #   )
 #
-# Note: `caption_image`/captioning for image-only deck slides needs the multimodal
-# LLM configured on the WORKER (llm.env_config()); otherwise those slides index on
-# their sparse text only (best-effort, never fatal — see deck.py :: _caption).
+# Note: the enrich stage needs the multimodal LLM configured on the WORKER
+# (llm.env_config()); otherwise image-only pages/slides index on their sparse text
+# only (best-effort, never fatal — see paper.py :: caption_image).

@@ -54,7 +54,7 @@ def reap_once() -> int:
     """Re-enqueue sources a worker abandoned. Returns how many were re-enqueued."""
     with db.pool().connection() as conn:
         rows = conn.execute(
-            "SELECT id, user_id, kind, url, storage_key, title FROM ms_videos "
+            "SELECT id, user_id, kind, url, storage_key, title, attempts FROM ms_videos "
             "WHERE (status = ANY(%s) "
             "       AND updated_at < now() - (%s * interval '1 second')) "
             "   OR (status = ANY(%s) "
@@ -68,6 +68,21 @@ def reap_once() -> int:
     n = 0
     for r in rows:
         kind = (r.get("kind") or "video")
+        # DEAD-LETTER (design §7, §20). A source that raises gets terminal
+        # `failed` from its own flow and never reaches this sweep. The dangerous
+        # one is a source that KILLS the worker — an OOM on a pathological PDF is
+        # not an exception, so nothing marks it failed, and re-enqueueing it just
+        # kills the next worker. Without a cap that is an infinite loop that eats
+        # the pool. `attempts` was already counted on every run and only ever
+        # printed; this is what makes it mean something.
+        attempts = int(r.get("attempts") or 0)
+        if attempts >= config.MAX_INGEST_ATTEMPTS:
+            db.set_status(r["id"], "failed",
+                          error=f"dead-lettered after {attempts} attempts — "
+                                f"the source keeps stranding its worker. Inspect "
+                                f"it and POST a retry once fixed.")
+            print(f'[reconciler] dead-lettered id="{r["id"]}" after {attempts} attempts')
+            continue
         try:
             if kind in ("paper", "deck"):
                 jobs_documents.enqueue_document(

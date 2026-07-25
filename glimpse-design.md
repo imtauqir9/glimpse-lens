@@ -340,6 +340,18 @@ Multimodal LLM calls (especially with image frames) and embedding dominate cost 
 - **Cost control** — one warm CLIP model, int8 memory, dedup, and rescore-only-on-shortlist keep RAM and compute bounded.
 - **Turn the demo into something that eats a real backfill:** malformed PDFs, 500-page files, rate limits, partial failures — all handled, all observable.
 
+**Which of those are actually built** — the bullets above are the principles; this is the state of the code, because "resilient workers" is the kind of phrase that hides a gap:
+
+| | State |
+|---|---|
+| Idempotency | Built — deterministic uuid5 point ids + delete-before-upsert |
+| Retries | Built — per-stage Prefect task policies (`ingest/flows.py`) |
+| Redelivery after a crash | Built — `reconciler.py`, the piece that turns crash-safe *code* into a no-loss *guarantee* |
+| Dead-letter | Built — `MAX_INGEST_ATTEMPTS`, then parked at `failed` with a reason. Without it the reconciler retried a worker-killing document forever |
+| Health checks | Built — `/api/health`, plus Fly restart policies |
+| Backpressure | Partial — the WFQ dispatcher caps in-flight **videos**; documents skip it (`db.wfq_claim` filters `kind='video'`), so a tenant bulk-posting papers is not fairly throttled |
+| Graceful SIGTERM | **Not built.** No signal handling anywhere in `src/`. Prefect's runner owns process lifecycle, and a killed run is recovered by the reconciler rather than drained on the way out. That is a weaker guarantee than draining — it costs the in-flight work, which is then redone — but it is the one actually exercised by `bench.py --resilience` |
+
 ## 20. Failure Modes & Mitigations
 
 | Failure | Mitigation |

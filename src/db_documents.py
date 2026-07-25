@@ -126,6 +126,9 @@ def list_sources(user_id: str, kind: str | None = None) -> list[dict[str, Any]]:
             "status": r["status"],
             "pct": round((r.get("progress") or 0.0) * 100),   # 0..1 → 0..100
             "error": r.get("error"),
+            # Surfaced so a dead-lettered source is visible as one: `failed` with
+            # attempts at MAX_INGEST_ATTEMPTS is a poison document, not a blip.
+            "attempts": r.get("attempts") or 0,
             "chunk_count": r.get("frame_count"),   # frame_count reused as chunks for docs
             "created_at": r.get("created_at"),
             "updated_at": r.get("updated_at"),
