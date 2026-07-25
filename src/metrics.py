@@ -1,10 +1,16 @@
-"""In-process Prometheus-style metrics (design §10 observability).
+"""Prometheus-style metrics (design §10 observability).
 
-Single-process counters + latency histograms rendered in the Prometheus text
-exposition format at GET /metrics. Correct for one API replica / a demo; for a
-multi-replica deployment use a real Prometheus client and aggregate across
-replicas. Live ingest queue-depth gauges are computed from Postgres at scrape
-time by the /metrics route (see api/search.py).
+Counters + latency histograms rendered in the Prometheus text exposition format
+at GET /metrics, and as a JSON rollup at GET /api/metrics.json.
+
+Counters are cluster-wide when REDIS_URL is set: `inc()` writes through to a
+Redis hash, and BOTH readers (`render()` and `snapshot()`) prefer it, so the two
+endpoints always agree and the totals survive a machine restart. Without Redis
+they fall back to this process's memory — fine for one replica / local dev.
+
+Latency histograms are still per-replica in-process state; they reset when a
+machine stops. Live ingest queue-depth gauges are computed from Postgres at
+scrape time by the /metrics route (see api/search.py).
 """
 from __future__ import annotations
 
@@ -74,7 +80,23 @@ def _fmt(labels: tuple, extra: dict | None = None) -> str:
 
 
 def render() -> str:
-    """Prometheus text exposition of all counters + histograms."""
+    """Prometheus text exposition of all counters + histograms.
+
+    COUNTERS are cluster-wide when Redis is available — the same source
+    `snapshot()` uses, so /metrics and /api/metrics.json can't disagree. This
+    matters more than it looks: the api process auto-stops when idle
+    (min_machines_running = 0), so in-process counters reset to zero on every
+    idle cycle and Prometheus sees a counter reset. The Redis totals are
+    monotonic across restarts, which is what a counter is supposed to be.
+
+    Assumes ONE scrape target in front of the cluster (the public hostname, as
+    configured in monitoring/prometheus.yml). Scraping each machine separately
+    would multiply the cluster total by the number of replicas.
+
+    HISTOGRAMS stay per-replica: bucket state is in-process, so latency still
+    resets when a machine stops. Fixing that needs Redis-backed buckets, which
+    is a bigger change than this one.
+    """
     out: list[str] = []
     with _lock:
         counters = list(_counters.items())
@@ -82,6 +104,18 @@ def render() -> str:
         hsum = dict(_hsum)
         hcount = dict(_hcount)
         hbucket = {k: dict(v) for k, v in _hbucket.items()}
+
+    r = redis_client.client()
+    if r is not None:
+        try:
+            counters = [(_parse_field(f), float(v))
+                        for f, v in r.hgetall(_CTR_HASH).items()]
+        except Exception:  # noqa: BLE001
+            pass            # Redis blipped — this replica's numbers still render
+
+    # hgetall returns arbitrary order; keep each metric family contiguous so the
+    # single "# TYPE" line still precedes all of its samples.
+    counters.sort(key=lambda kv: (kv[0][0], sorted(dict(kv[0][1]).items())))
 
     seen = set()
     for (name, labels), val in counters:
