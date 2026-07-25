@@ -52,6 +52,10 @@ def _schedule_ingest(source_id: str, uri: str | None, key: str | None,
             source_id=source_id, uri=uri or key or "", title=title,
             kind=kind, user_id=uid, storage_key=key,
         )
+        # pending → queued now that a Prefect run exists. This is what lets the
+        # reconciler tell "waiting for a worker" (normal, leave it alone) from
+        # "the schedule never landed" (stranded) — see reconciler.py.
+        db_documents.mark_queued(source_id)
     except Exception as exc:  # noqa: BLE001
         db.set_status(source_id, "failed", error=f"schedule failed: {exc}")
 

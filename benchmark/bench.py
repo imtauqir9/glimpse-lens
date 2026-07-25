@@ -75,7 +75,22 @@ POLL_S = 2.0
 
 # ── Tiny HTTP client (stdlib) ─────────────────────────────────────────────────
 def _req(method: str, path: str, body: dict | None = None,
-         auth: bool = False) -> tuple[int, dict]:
+         auth: bool = True) -> tuple[int, dict]:
+    """Every request carries the credential when there is one.
+
+    Sending it on POSTs only (the earlier shape) silently breaks the gate the
+    moment auth is active: GET /admin/sources 401s, so wait_indexed() sees an
+    empty list and spins until INDEX_TIMEOUT_S, and throughput is then measured
+    as 0 chunks over 900s. A misconfigured benchmark reads exactly like a slow
+    pipeline — so it must fail loudly instead (see _check_auth).
+
+    Tenant caveat: when auth is active the tenant comes from the KEY, not from
+    X-User-Id (src/auth.py :: resolve_identity — the header is spoofable, so it
+    is honored only in open dev mode). So BENCH_USER isolates the benchmark
+    corpus ONLY against a server with auth off. To isolate against a live
+    deployment, mint a key for a throwaway tenant (POST /admin/keys) and put
+    THAT key in ADMIN_TOKEN.
+    """
     url = BASE_URL + path
     data = json.dumps(body).encode() if body is not None else None
     headers = {"Content-Type": "application/json", "X-User-Id": USER}
@@ -104,6 +119,19 @@ def post_document(doc: dict) -> tuple[int, dict, float]:
 def get_sources() -> list[dict]:
     _, body = _req("GET", SOURCES_PATH)
     return body.get("sources", [])
+
+
+def check_auth() -> None:
+    """Fail fast if the status endpoint isn't readable.
+
+    Without this, an auth misconfiguration is indistinguishable from a slow
+    pipeline: every poll returns nothing, wait_indexed() times out, and the gate
+    reports a throughput number that measured nothing at all."""
+    status, body = _req("GET", SOURCES_PATH)
+    if status in (401, 403):
+        sys.exit(f"FATAL: {SOURCES_PATH} returned {status} — set ADMIN_TOKEN to a "
+                 f"key with the admin role. Every SLA below reads this endpoint, "
+                 f"so a benchmark run without it would measure nothing. ({body})")
 
 
 def ask(question: str, top_k: int = RECALL_K) -> tuple[dict, float]:
@@ -160,6 +188,7 @@ def wait_indexed(ids: set[str], timeout_s: int = INDEX_TIMEOUT_S) -> dict[str, d
     Returns {id: source_row}."""
     deadline = time.time() + timeout_s
     seen: dict[str, dict] = {}
+    pending: list[str] = list(ids)
     while time.time() < deadline:
         rows = {s["id"]: s for s in get_sources() if s["id"] in ids}
         seen.update(rows)
@@ -167,6 +196,11 @@ def wait_indexed(ids: set[str], timeout_s: int = INDEX_TIMEOUT_S) -> dict[str, d
         if not pending:
             return seen
         time.sleep(POLL_S)
+    # Timing out silently would let the caller divide a chunk count by the full
+    # timeout and report it as throughput — say so instead.
+    print(f"     WARNING: timed out after {timeout_s}s with "
+          f"{len(pending)}/{len(ids)} not terminal — any rate below is measured "
+          f"over the timeout, not over real work.")
     return seen
 
 
@@ -313,6 +347,7 @@ def main() -> None:
     except Exception as e:  # noqa: BLE001
         sys.exit(f"FATAL: cannot reach {BASE_URL} ({e}). Is the app up?")
     print(f"Target {BASE_URL} (user={USER!r})  health={status}")
+    check_auth()
 
     g = load_golden(args.golden)
     gate = Gate()

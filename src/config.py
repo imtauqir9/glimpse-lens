@@ -101,6 +101,12 @@ PRESIGN_EXPIRY_S = _int("PRESIGN_EXPIRY_S", 900)          # presigned PUT lifeti
 PRESIGN_GET_EXPIRY_S = _int("PRESIGN_GET_EXPIRY_S", 3600)  # thumbnails / playback
 MAX_UPLOAD_MB = _int("MAX_UPLOAD_MB", 2048)                # register rejects bigger objects
 ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must start with
+# Document ingest fetches a CALLER-SUPPLIED URL from the worker, which sits on
+# the private network next to the clip service, Redis and the cloud metadata
+# endpoint. src/ingest/paper.py :: _assert_public_url refuses anything resolving
+# off-public, so /admin/documents can't be used as a request-forgery primitive.
+# Set true only to ingest from a local file server in dev.
+ALLOW_PRIVATE_DOCUMENT_URLS = _envbool("ALLOW_PRIVATE_DOCUMENT_URLS", False)
 
 # --- Video ingest lifecycle ---------------------------------------------------
 # pending  = registered, waiting in our fair queue (not yet sent to Prefect)
@@ -109,8 +115,16 @@ ALLOWED_UPLOAD_TYPES = ("video/",)                         # content-type must s
 # embedding = CLIP + Qdrant upsert; skipped = duplicate (user_id, source_hash).
 VIDEO_STATUSES = ("pending", "queued", "fetching", "sampling", "embedding",
                   "indexed", "skipped", "failed")
-# In-flight = occupying execution capacity (scheduled or running).
-INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "embedding")
+# Document (paper/deck) stages, mirroring the video lifecycle — they share the
+# ms_videos table and the same worker pool (src/ingest/flows.py).
+DOCUMENT_STAGE_STATUSES = ("parsing", "chunking")
+# In-flight = occupying execution capacity (scheduled or running). Document
+# stages count too: a worker slot busy parsing a PDF is a slot the video
+# dispatcher must not hand out again.
+INFLIGHT_STATUSES = ("queued", "fetching", "sampling", "embedding",
+                     *DOCUMENT_STAGE_STATUSES)
+# Actively executing on a worker (a crash here strands the row → reconciler).
+RUNNING_STATUSES = ("fetching", "sampling", "embedding", *DOCUMENT_STAGE_STATUSES)
 
 # --- Fair scheduling (WFQ) ----------------------------------------------------
 # FIFO (default off): register enqueues to Prefect immediately -> Prefect runs
@@ -192,6 +206,14 @@ TEXT_EMBED_DIM = _int("TEXT_EMBED_DIM", 1536 if _TE_OPENAI else 384)
 TEXT_EMBED_API_KEY = os.getenv("TEXT_EMBED_API_KEY", "").strip()
 TEXT_EMBED_BASE_URL = os.getenv("TEXT_EMBED_BASE_URL", "").strip()
 TEXT_EMBED_VERSION = os.getenv("TEXT_EMBED_VERSION", f"{TEXT_EMBED_MODEL}-v1")
+# fastembed throughput knobs. A paper is hundreds of chunks in ONE embed call,
+# and that call is the ingest bottleneck on CPU (design §9: the embedder is the
+# wall, not the worker count). fastembed can shard a large batch across
+# processes: parallel=0 uses every core. Only worth it above a threshold —
+# spawning workers for a 20-chunk deck costs more than it saves.
+TEXT_EMBED_BATCH = _int("TEXT_EMBED_BATCH", 64)
+TEXT_EMBED_PARALLEL = _int("TEXT_EMBED_PARALLEL", 0)        # 0 = all cores
+TEXT_EMBED_PARALLEL_MIN = _int("TEXT_EMBED_PARALLEL_MIN", 256)  # texts before sharding
 # Transcript chunking: group caption cues into ~CHUNK_SECONDS windows so a chunk
 # is a coherent spoken passage with a real t_start/t_end, not one tiny cue.
 TRANSCRIPT_CHUNK_SECONDS = _float("TRANSCRIPT_CHUNK_SECONDS", 20.0)

@@ -84,6 +84,24 @@ def upsert_pending_document(
     return row
 
 
+def mark_queued(source_id: str) -> None:
+    """pending → queued, once the Prefect run actually exists.
+
+    Documents skip the fair dispatcher (it claims `kind='video'` only), so
+    without this a document would sit at `pending` from registration until a
+    worker picked it up — indistinguishable from "the schedule call never
+    landed". The reconciler needs that distinction to know what is genuinely
+    stranded (see reconciler.py). Guarded on status='pending' so it can never
+    drag a row a worker has already advanced back to the start.
+    """
+    with pool().connection() as conn:
+        conn.execute(
+            "UPDATE ms_videos SET status = 'queued', updated_at = now() "
+            "WHERE id = %s AND status = 'pending'",
+            (source_id,),
+        )
+
+
 def list_sources(user_id: str, kind: str | None = None) -> list[dict[str, Any]]:
     """Unified video + document listing for GET /admin/sources.
 

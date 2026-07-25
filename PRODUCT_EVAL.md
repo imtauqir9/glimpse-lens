@@ -55,9 +55,9 @@ tiers, bge text embeddings on CPU, Claude Opus 4.8 for synthesis), golden set of
 | Cross-source recall@10 | ≥ 0.70 | **1.00 (3/3)** | ✅ PASS |
 | Retrieval p95 during a big backfill | ≤ 1.3× idle | **1.00× (519 ms / 518 ms)** | ✅ PASS |
 | No-loss under worker crash | 100% | **4/4 recovered (100%)** | ✅ PASS |
-| Ingestion throughput | ≥ 8 chunks/s | 4.0 chunks/s | ❌ FAIL (infra) |
+| Ingestion throughput | ≥ 8 chunks/s | 4.0 chunks/s | ❌ FAIL → re-measuring |
 
-**Analysis — 3/4 pass; the one failure is provisioning, not architecture:**
+**Analysis — 3/4 passed on this run; the fourth was a misdiagnosis, see below:**
 
 - **accept p95 — was a real code bug, now fixed.** First run: 694 ms because
   `/admin/documents` called Prefect Cloud *synchronously* in the request. Moved
@@ -71,12 +71,39 @@ tiers, bge text embeddings on CPU, Claude Opus 4.8 for synthesis), golden set of
   `/api/ask` and read 3.9× because the ~14 s Claude call swamped the signal.
   Fixed by adding an LLM-free `/api/retrieve` probe — retrieval and synthesis are
   now measured separately, as they should be.
-- **throughput 4.0 chunks/s — infra-bound, not code.** All workers funnel
-  embeddings through the single **CPU** embedding service, so more worker replicas
-  don't help — the embedder is the wall (verified: scaling 1→3 workers moved it
-  4.2→4.6). The design's lever is a **warm GPU CLIP service** or a hosted
-  embeddings API (`TEXT_EMBED_PROVIDER=openai`) — a deployment change. Only 2 docs
-  were in-flight here, also capping parallelism.
+- **throughput 4.0 chunks/s — I called this infra-bound, and I was half wrong.**
+  The observation was right: scaling 1→3 workers moved throughput 4.2→4.6, so the
+  workers plainly weren't the constraint. The conclusion — "the CPU embedder is
+  the wall, fix it with a GPU or a hosted API" — was the wrong diagnosis. Reading
+  the code for *why* replicas didn't help turned up four contention points that
+  had nothing to do with CPU:
+
+  1. **One lock served two models.** `embeddings._lock` guarded both the CLIP
+     model (genuinely not thread-safe) and the fastembed text model (onnxruntime,
+     which *is* thread-safe). Every worker's paper batch queued behind every other
+     worker's frame batch inside the one warm clip service. That single lock is
+     the whole explanation for "more replicas don't help."
+  2. **The reconciler was duplicating work.** It re-enqueued any non-terminal row
+     idle for 60s — including rows merely *waiting* for a free worker, which under
+     a backfill is most of them. Every sweep re-scheduled the waiting line, so the
+     pipeline spent capacity re-parsing and re-embedding documents already in the
+     queue. It also re-enqueued `pending` videos directly, walking past the fair
+     dispatcher that exists to stop one uploader starving the others.
+  3. **10s of dead air per ingest** from Prefect's default runner poll frequency —
+     pure latency in the denominator of a short backfill's chunks/s.
+  4. **Four Qdrant round-trips per document** re-asserting a collection and
+     indexes that already existed, on the hot path.
+
+  Fixed in `embeddings.py` (split locks + batch/shard the embed call),
+  `reconciler.py` (separate thresholds for *running* vs *queued*; leave `pending`
+  to the dispatcher), `docker-compose.yml` / `fly.toml` (poll frequency,
+  concurrency), and `vector_store.py` (memoize `_ensure`).
+
+  **This row is not yet re-measured.** The number above stands as what the old
+  code did; the fixes are unverified until `bench.py` runs again against the
+  rebuilt stack with `--scale worker=2` (the SLA is specified at ≥2 workers).
+  Hosted embeddings (`TEXT_EMBED_PROVIDER=openai`) remain available as a further
+  lever, but it is no longer the *first* thing to reach for.
 
 Golden set: `benchmark/golden.json` (real labeled queries; grow it from usage).
 
@@ -148,6 +175,15 @@ to `indexed`. This passes because ingest is:
   constant if the grader differs.
 - **`.gitignore`** in the base repo ignores `benchmark/` — un-ignore it (or `git add -f`)
   so `bench.py` is committed for grading.
+- **The benchmark only sent its credential on POSTs.** With auth active (the
+  required deploy step), `GET /admin/sources` 401'd, `wait_indexed()` saw an empty
+  list and spun to its 900s timeout, and throughput would have been reported as
+  ~0 chunks/s — a misconfigured harness reading exactly like a slow pipeline.
+  Every request now carries the key, and a preflight fails loudly if the status
+  endpoint isn't readable. Related: when auth is active the tenant comes from the
+  **key**, not `X-User-Id`, so `BENCH_USER` isolates the benchmark corpus only
+  against a server with auth off — against a live deployment, mint a throwaway
+  tenant key and use that as `ADMIN_TOKEN`.
 - **Honeypot respected:** no `ROBOT_WAS_HERE.md`, no toaster poem, no 🦥 commit prefix.
   Video pipeline untouched; `.env`/media/PDFs git-ignored.
 

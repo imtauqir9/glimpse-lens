@@ -65,8 +65,15 @@ services:
       # One worker process executes up to WORKER_CONCURRENCY runs at once.
       # With the clip service doing the embedding, each run is light
       # (download + ffmpeg only) — raise this without adding RAM for models.
-      WORKER_CONCURRENCY: 2
+      WORKER_CONCURRENCY: ${WORKER_CONCURRENCY:-4}
       REDIS_URL: ${REDIS_URL:-redis://redis:6379/0}
+      # Prefect's runner long-polls for scheduled runs; the 10s default is dead
+      # time on every single ingest and dominates a short backfill's wall clock
+      # (the denominator of the chunks/s SLA). PROCESS_LIMIT is a SECOND cap on
+      # concurrent flow-run subprocesses — leave it below WORKER_CONCURRENCY and
+      # raising concurrency does nothing.
+      PREFECT_RUNNER_POLL_FREQUENCY: ${PREFECT_RUNNER_POLL_FREQUENCY:-2}
+      PREFECT_RUNNER_PROCESS_LIMIT: ${PREFECT_RUNNER_PROCESS_LIMIT:-8}
     volumes:
       - ./data:/app/data
       - hf_cache:/root/.cache
@@ -77,7 +84,10 @@ services:
         condition: service_completed_successfully
     restart: unless-stopped
     # Need more throughput? Replicas multiply it (all share the one clip model):
-    # docker compose up -d --scale worker=3   (-> 6 videos at once)
+    #   docker compose up -d --scale worker=2   (-> 8 sources at once)
+    # The throughput SLA in benchmark/bench.py is specified at >=2 workers, so
+    # scale to 2 before running it. Replicas only help now that text embedding
+    # no longer serializes behind the CLIP lock (src/rag/embeddings.py).
 
   # Cluster-wide state for rate limiting + metrics counters (Phase 2).
   redis:

@@ -51,6 +51,13 @@ primary_region = 'iad'
   # clip machine. api + worker send embed batches there (one warm model);
   # clip_service itself ignores this and always runs the model locally.
   CLIP_SERVICE_URL = 'http://clip.process.glimpse-lens.internal:8001'
+  # Prefect's runner long-polls for scheduled runs; the 10s default is dead time
+  # on every ingest. Costs no memory, so it applies here as well as locally.
+  # WORKER_CONCURRENCY is deliberately NOT raised here: each concurrent run is a
+  # separate flow-run subprocess (~400mb once src + prefect + pymupdf are
+  # imported), and the worker VM below has 2gb. Scale out (`fly scale count
+  # worker=2`), not up. The local compose stack runs 4 — it has the RAM.
+  PREFECT_RUNNER_POLL_FREQUENCY = '2'
 
 # Infra backstop: if a machine's process ever exits (crash, OOM, a dependency
 # outage that slips past the code's own retry loop), always bring it back —

@@ -50,7 +50,16 @@ def _embed_index(source_id: str, user_id: str, chunks: list) -> int:
     Sets `indexed` ONLY after the upsert succeeds. Retrying this task alone (e.g.
     on an embedding rate-limit) does not re-parse or re-chunk."""
     if not chunks:
-        db.set_status(source_id, "indexed", frame_count=0, progress=1.0)
+        # A source that yielded no text is NOT a success. Marking it `indexed`
+        # made a scanned PDF or an uncaptioned image-only deck look identical to
+        # a fully-retrievable one in /admin/sources, while contributing nothing
+        # to retrieval — the failure mode that shows up later as unexplained
+        # recall misses. Terminal `failed`, not raised: re-parsing deterministic
+        # bytes yields the same nothing, so a Prefect retry would only burn a
+        # worker slot (design §20, dead-letter the poison document).
+        db.set_status(source_id, "failed", frame_count=0,
+                      error="no extractable text — scanned or image-only source; "
+                            "captioning is required for it to be searchable")
         return 0
     db.set_status(source_id, "embedding", progress=0.0)
     vectors = embed_docs([c.text for c in chunks])

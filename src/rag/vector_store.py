@@ -88,8 +88,19 @@ def _user_filter(user_id: str, video_id: str | None = None,
     return qm.Filter(must=must)
 
 
+_ensured: set[str] = set()
+
+
 def _ensure(collection: str, dim: int) -> None:
-    """Create a collection (low-RAM profile) + tenant/video payload indexes."""
+    """Create a collection (low-RAM profile) + tenant/video payload indexes.
+
+    Memoized per process: every ingest calls this, and once the collection and
+    its indexes exist the four Qdrant round-trips below are pure latency on the
+    hot path. Creation is idempotent, so a cold process re-checking once is all
+    the safety this needs.
+    """
+    if collection in _ensured:
+        return
     c = client()
     if not c.collection_exists(collection):
         c.create_collection(
@@ -124,6 +135,7 @@ def _ensure(collection: str, dim: int) -> None:
                                field_schema=qm.PayloadSchemaType.KEYWORD)
     except Exception:
         pass
+    _ensured.add(collection)
 
 
 def ensure_collection() -> None:

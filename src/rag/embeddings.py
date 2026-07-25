@@ -30,7 +30,20 @@ import numpy as np
 
 from .. import config
 
+# Two separate locks, deliberately.
+#
+# _lock guards the CLIP model: sentence-transformers/torch modules are NOT
+# thread-safe, so image and CLIP-text encodes must serialize.
+#
+# _text_init guards only the CONSTRUCTION of the fastembed text model, not its
+# inference. fastembed is onnxruntime, whose InferenceSession.run IS thread-safe
+# — so text embedding runs concurrently, with itself and with CLIP. Sharing one
+# lock across both (the original shape) meant every worker's transcript/paper
+# batch queued behind every other worker's frame batch inside the one warm clip
+# service. That is why scaling 1→3 workers barely moved throughput: the workers
+# were never the constraint, the lock was.
 _lock = threading.Lock()
+_text_init = threading.Lock()
 
 
 # ── Local inference (used in-process, and by clip_service.py) ────────────────
@@ -83,26 +96,40 @@ def embed_text_local(text: str) -> np.ndarray:
 # So the transcript branch uses a proper small text model (bge), a separate,
 # lightweight (onnx, no torch) space from the CLIP vectors.
 
-@lru_cache
 def _text_model():
+    # lru_cache alone would let two threads race into a double model load on a
+    # cold service, so construction takes _text_init; inference below does not.
+    with _text_init:
+        return _text_model_cached()
+
+
+@lru_cache
+def _text_model_cached():
     from fastembed import TextEmbedding
 
     return TextEmbedding(config.TEXT_EMBED_MODEL)
 
 
 def embed_docs_local(texts: list[str]) -> np.ndarray:
-    """Embed transcript chunks (documents) — bge, L2-normalized already."""
+    """Embed transcript / paper / deck chunks — bge, L2-normalized already.
+
+    Unlocked on purpose (see the note by _text_init). Large batches are sharded
+    across cores by fastembed; small ones are not, because process spin-up would
+    cost more than the parallelism buys.
+    """
     if not texts:
         return np.zeros((0, config.TEXT_EMBED_DIM), dtype=np.float32)
-    with _lock:
-        vecs = list(_text_model().embed(texts))
+    model = _text_model()
+    kwargs = {"batch_size": config.TEXT_EMBED_BATCH}
+    if len(texts) >= config.TEXT_EMBED_PARALLEL_MIN:
+        kwargs["parallel"] = config.TEXT_EMBED_PARALLEL
+    vecs = list(model.embed(texts, **kwargs))
     return np.asarray(vecs, dtype=np.float32)
 
 
 def embed_query_local(text: str) -> np.ndarray:
     """Embed a search query for the transcript branch (bge query prompt)."""
-    with _lock:
-        vec = next(iter(_text_model().query_embed([text])))
+    vec = next(iter(_text_model().query_embed([text])))
     return np.asarray(vec, dtype=np.float32)
 
 

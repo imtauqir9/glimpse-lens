@@ -32,14 +32,16 @@ column, /admin/documents + /admin/sources, read-path citation rendering).
 """
 from __future__ import annotations
 
-import io
+import ipaddress
+import socket
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass, field
 
 import fitz  # PyMuPDF  (pip install pymupdf)
 
 # --- shared repo pieces (REAL names, reconciled against momentsearch/src) ------
-from .. import db, storage                       # db.set_status / storage.get_bytes
+from .. import config, db, storage               # db.set_status / storage.get_bytes
 from ..config import TEXT_EMBED_VERSION          # version tag carried in the payload
 from ..rag import vector_store                   # ensure_text_collection / upsert_chunks / delete_video
 from ..rag.embeddings import embed_docs          # text (bge / OpenAI) embeddings
@@ -68,6 +70,54 @@ class Chunk:
 
 
 # 0) FETCH ─────────────────────────────────────────────────────────────────────
+def _assert_public_url(url: str) -> None:
+    """Refuse URLs that resolve inside the deployment's own network.
+
+    `uri` is caller-supplied and this fetch runs on the WORKER, which sits on the
+    private network with the clip service, Redis and the cloud provider's
+    metadata endpoint. Unchecked, `POST /admin/documents` is a request-forgery
+    primitive: point it at http://169.254.169.254/… or a *.internal address and
+    the response is parsed and indexed as a "paper", readable back through
+    search. Design §11 says to assume ingested content is hostile — that has to
+    cover the fetch, not just the bytes.
+
+    Checked after DNS resolution, so a public hostname with a private A record
+    doesn't slip through. Every redirect hop is re-checked too (see
+    _VettedRedirects) — arXiv redirects PDF URLs to their versioned form, so
+    refusing redirects outright would break the ordinary case, and validating
+    only the first URL would leave the hole wide open.
+    """
+    if config.ALLOW_PRIVATE_DOCUMENT_URLS:   # dev escape hatch, off by default
+        return
+    host = urllib.parse.urlsplit(url).hostname
+    if not host:
+        raise ValueError(f"Document URL has no host: {url!r}")
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror as exc:
+        raise ValueError(f"Cannot resolve document host {host!r}: {exc}") from exc
+    for info in infos:
+        ip = ipaddress.ip_address(info[4][0])
+        if not ip.is_global:
+            raise ValueError(
+                f"Refusing to fetch {host!r}: it resolves to the non-public "
+                f"address {ip}. Documents must come from a public URL or an "
+                f"object-storage key.")
+
+
+class _VettedRedirects(urllib.request.HTTPRedirectHandler):
+    """Re-run the public-address check on every redirect target.
+
+    urllib follows redirects itself, so without this a public URL could bounce
+    the worker straight to a private one after the initial check had passed —
+    the classic way an SSRF filter gets walked around.
+    """
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):  # noqa: ANN001
+        _assert_public_url(newurl)
+        return super().redirect_request(req, fp, code, msg, headers, newurl)
+
+
 def _load_bytes(uri: str, storage_key: str | None) -> bytes:
     """Bucket key → object storage; http(s) URI → download (size-capped).
 
@@ -80,8 +130,10 @@ def _load_bytes(uri: str, storage_key: str | None) -> bytes:
     if storage_key:
         return storage.get_bytes(storage_key)
     if uri.startswith(("http://", "https://")):
+        _assert_public_url(uri)
         req = urllib.request.Request(uri, headers={"User-Agent": "momentsearch/glimpse"})
-        with urllib.request.urlopen(req, timeout=120) as resp:
+        opener = urllib.request.build_opener(_VettedRedirects)
+        with opener.open(req, timeout=120) as resp:
             cap = MAX_FETCH_MB * 1024 * 1024
             data = resp.read(cap + 1)
             if len(data) > cap:

@@ -14,14 +14,34 @@
 ## Run
 
 ```bash
+docker compose up -d --scale worker=2     # the throughput SLA is specified at >=2 workers
+
 export BASE_URL=http://localhost:8100
-export ADMIN_TOKEN=...          # if the server sets one
-export BENCH_USER=bench         # isolate benchmark data in its own tenant
+export ADMIN_TOKEN=...          # required whenever the server has auth on
+export BENCH_USER=bench         # isolate benchmark data in its own tenant (see below)
 cp benchmark/golden.example.json benchmark/golden.json   # then fill with REAL queries
 
 python benchmark/bench.py                 # accept + throughput + recall + decoupling
 python benchmark/bench.py --resilience     # kill-a-worker no-loss
 ```
+
+**Two things that will silently invalidate a run:**
+
+- **Scale to ≥2 workers first.** The throughput target is written for that; one
+  worker measures a different system.
+- **`ADMIN_TOKEN` must be set whenever the server has auth on.** Every SLA here
+  reads `/admin/sources` to know when indexing finished. A 401 there looks
+  identical to a pipeline that never finishes — the poll returns nothing, the
+  wait burns its full 900s timeout, and throughput comes out near zero. `bench.py`
+  now preflights that endpoint and refuses to run rather than report a number it
+  didn't measure.
+
+**Tenant caveat on `BENCH_USER`:** it isolates the benchmark corpus only when the
+server has auth *off*. With auth on, the tenant comes from the API key, not the
+`X-User-Id` header (`src/auth.py :: resolve_identity` — the header is spoofable,
+so it's honored in open dev mode only). To keep a live deployment's demo corpus
+clean, mint a key for a throwaway tenant via `POST /admin/keys` and put that key
+in `ADMIN_TOKEN`.
 
 ## The golden set
 
