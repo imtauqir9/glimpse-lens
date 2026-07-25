@@ -7,8 +7,24 @@
 #
 # fly launch --no-deploy --copy-config
 # Get-Content .env | Where-Object { $_ -match '^[A-Z_]+=.+' -and $_ -notmatch '^FLY_' } | fly secrets import
+# fly redis create                          # Upstash -> REDIS_URL (see below)
+# fly secrets set REDIS_URL='redis://…' ADMIN_TOKEN='…'
 # fly deploy --ha=false
 # fly scale count worker=2        # more ingest throughput, anytime
+#
+# Two secrets the enterprise layer needs — both absent = the app still runs, but
+# degraded in ways that are invisible from the outside, so set them:
+#   REDIS_URL    rate limiting + metrics counters are shared across replicas.
+#                Without it each machine keeps its OWN counters, so a 30/min
+#                limit becomes 30×N and /metrics reports one machine's slice.
+#                `fly redis create` (Upstash) prints the URL; it resolves over
+#                Fly private networking, no public egress.
+#   ADMIN_TOKEN  turns auth ON (src/auth.py: active once a master token or any
+#                minted key exists). Unset => every route is open, including
+#                /admin/* and /metrics. Set it, then mint per-tenant `glk_` keys
+#                through POST /admin/keys.
+# The `ms_api_keys` + `ms_audit` tables create themselves at API startup
+# (app.py lifespan, IF NOT EXISTS) — no migration step.
 
 app = 'glimpse-lens'
 primary_region = 'iad'
@@ -76,3 +92,21 @@ primary_region = 'iad'
   size = 'shared-cpu-2x'
   memory = '2gb'          # the one warm CLIP model (~1.5gb loaded)
   processes = ['clip']
+
+# Monitoring. `monitoring/` (Prometheus + Grafana + alerts) is a docker-compose
+# stack, deliberately NOT a Fly process group: Prometheus needs a persistent
+# volume for its TSDB, and a per-app time-series database is the wrong thing to
+# pay for here. Two supported ways to watch production — see DEPLOYMENT.md
+# "Monitoring the deployed app":
+#   1. Point the local compose stack at the Fly app (scrapes with ADMIN_TOKEN).
+#   2. Fly's managed Prometheus via the block below.
+#
+# The managed scraper sends NO Authorization header, and /metrics is admin-gated
+# (src/api/search.py), so enabling this as-is yields 401s on every scrape. It
+# works only if you first make /metrics readable unauthenticated — acceptable
+# only because Fly scrapes over the private network, never the public edge.
+# Left commented: opening a metrics endpoint should be a deliberate choice.
+# [[metrics]]
+#   port = 8000
+#   path = '/metrics'
+#   processes = ['api']

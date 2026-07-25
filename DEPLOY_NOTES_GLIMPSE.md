@@ -1,7 +1,14 @@
 # Deploy notes — Glimpse (paper/deck) additions
 
-The base `DEPLOYMENT.md` is complete and **unchanged** — follow it as-is. The
-document-ingest extension needs **no new infrastructure and no new secrets**:
+> **Superseded in part.** When this was written the deploy needed no new infra or
+> secrets. The enterprise phases since then added two: `REDIS_URL` (shared rate
+> limits + metrics) and `ADMIN_TOKEN` (turns auth on — without it the public app
+> is open). Both are now steps **3a** and **3b** in `DEPLOYMENT.md`, along with a
+> "Monitoring the deployed app" section. Everything below still holds for the
+> **document-ingest** path specifically.
+
+The base `DEPLOYMENT.md` is complete — follow it as-is. The document-ingest
+extension itself needs **no new infrastructure and no new secrets**:
 
 - `pymupdf` + `python-pptx` are in `requirements.txt`, so the Docker image builds
   with them automatically (no Dockerfile change).
@@ -25,7 +32,8 @@ curl -si $APP/admin/documents -H "Authorization: Bearer $TOKEN" \
   -d '{"uri":"https://arxiv.org/pdf/2312.10997","kind":"paper","title":"RAG Survey"}' | head -1
 
 # walks to indexed, shows kind + pct
-curl -s $APP/admin/sources -H "X-User-Id: default" | python -m json.tool
+# (X-User-Id is ignored once auth is active — the key picks the tenant)
+curl -s $APP/admin/sources -H "Authorization: Bearer $TOKEN" | python -m json.tool
 
 # a query cites a paper PAGE
 curl -s $APP/api/ask -H 'content-type: application/json' \

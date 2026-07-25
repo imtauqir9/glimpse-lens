@@ -49,6 +49,9 @@ work from Fly):
 - **LLM** — `LLM_API_KEY`
 - A **Fly.io account** + the `flyctl` CLI installed.
 
+Two more get created during the deploy rather than beforehand — `REDIS_URL`
+(step 3a) and `ADMIN_TOKEN` (step 3b).
+
 > **The sample corpus is already indexed** in your shared Qdrant/Neon from local
 > runs, so the deploy's seed gate finds them done and skips re-downloading — the
 > deploy won't be blocked by YouTube.
@@ -102,6 +105,63 @@ $b64 = [Convert]::ToBase64String([IO.File]::ReadAllBytes("data/cookies.txt"))
 fly secrets set YT_COOKIES_B64="$b64"
 ```
 
+### 3a. Attach Redis (cluster-wide rate limits + metrics)
+
+Rate limiting and the metrics counters are only correct if **every replica shares
+one counter store**. With no `REDIS_URL`, `src/redis_client.py` falls back to
+per-process memory: a `RATE_LIMIT_PER_MIN=30` limit silently becomes 30 × the
+number of api machines, and `/metrics` reports whichever machine answered the
+scrape. Single replica → harmless. The moment you `fly scale count api=2` → wrong.
+
+```powershell
+fly redis create                 # Upstash; pick the same region as the app (iad)
+fly secrets set REDIS_URL='redis://default:<password>@<name>.upstash.io:6379'
+```
+
+The URL resolves over Fly's private network — no public egress, no extra cost at
+this volume. `redis>=5.0` is already in `requirements.txt`, so the image picks it
+up on the next build; the client is lazy-imported and only used when the URL is
+set. Confirm after deploy — the api logs print one line at first use:
+
+```
+[redis] connected (<name>.upstash.io:6379)
+```
+
+If you see `[redis] unavailable (…) — using in-memory fallback` instead, the app
+is still up and serving; it just isn't multi-replica-correct. Fix the URL.
+
+### 3b. Turn on auth (and mint the first key)
+
+Auth **fails open by design**: `src/auth.py` enforces keys only once an
+`ADMIN_TOKEN` is set or at least one key exists — that's what keeps `docker
+compose up` zero-config for local dev. On a public Fly URL that default means
+`/admin/*` (ingest, delete, key minting) and `/metrics` are wide open. Set the
+token as part of the first deploy, not after:
+
+```powershell
+fly secrets set ADMIN_TOKEN="$([guid]::NewGuid().Guid)"   # or any long random string
+```
+
+`ADMIN_TOKEN` doubles as a master admin key — that's the bootstrap. Use it once to
+mint real per-tenant keys, then use those:
+
+```powershell
+$APP = 'https://glimpse-lens.fly.dev'
+curl -s "$APP/admin/keys" -H "Authorization: Bearer $ADMIN_TOKEN" `
+  -H 'content-type: application/json' `
+  -d '{"user_id":"acme","role":"viewer","label":"demo read-only"}'
+```
+
+The plaintext key (`glk_…`) is returned **once** — only its SHA-256 hash is
+stored, so a database leak never yields a usable key. The key also determines the
+tenant, which is why `X-User-Id` stops being honored once auth is active: tenant
+isolation can no longer be bypassed by editing a header.
+
+Two tables back this — `ms_api_keys` (Phase 1) and `ms_audit` (Phase 3, the
+append-only who-did-what trail). Both are `CREATE TABLE IF NOT EXISTS` run in the
+API's startup lifespan, so they appear in Neon on the first boot of the new
+version. **Nothing to migrate by hand.**
+
 ### 4. Deploy
 
 ```powershell
@@ -144,6 +204,55 @@ fly secrets set WORKER_CONCURRENCY=3   # more videos per worker machine
 
 The `api` machine auto-stops when idle and auto-starts on the next request
 (`min_machines_running = 0` in fly.toml), so it costs almost nothing at rest.
+
+> Past `api=1`, set `REDIS_URL` first (step 3a) — otherwise the rate limiter and
+> the metrics counters fragment per machine.
+
+## Monitoring the deployed app
+
+The app exposes three things, all admin-gated:
+
+| Endpoint | What |
+|---|---|
+| `/metrics` | Prometheus text — request latency histograms, counters, live ingest queue depth (computed from Postgres at scrape time) |
+| `/api/metrics.json` | the same rollup as JSON, plus token/cost metering |
+| `/dashboard` | self-contained observability UI that polls the JSON |
+
+`/dashboard` needs nothing beyond the deploy — open `$APP/dashboard` and paste an
+admin key. For history and alerting you need a Prometheus, and there are two ways:
+
+**Option 1 — run the compose stack against Fly (works today).** `monitoring/` is
+a full Prometheus + Grafana + alert-rules stack. Point it at the deployed app by
+editing the target in `monitoring/prometheus.yml`:
+
+```yaml
+    static_configs:
+      - targets: ['glimpse-lens.fly.dev']
+        labels: { service: glimpse }
+    scheme: https          # add this line — the Fly app is HTTPS-only
+```
+
+then `docker compose up -d prometheus grafana` (Grafana on `:3000`, admin/admin;
+the Glimpse dashboard is auto-provisioned). The scrape authenticates with
+`ADMIN_TOKEN` from `.env` — the compose entrypoint writes it to
+`/tmp/prom_token`, which `prometheus.yml` reads via `credentials_file`. So the
+`.env` token must match the Fly secret.
+
+**Option 2 — Fly's managed Prometheus.** Uncomment the `[[metrics]]` block in
+`fly.toml` and metrics land in `fly-metrics.net` (hosted Grafana, no containers
+to run). **Caveat:** Fly's scraper sends no `Authorization` header, so it gets
+401 against the admin-gated `/metrics` as written — you'd have to drop the auth
+dependency on that one route first. That's defensible (Fly scrapes over the
+private network, never the public edge) but it's a real decision, which is why
+the block ships commented out.
+
+`monitoring/alerts.yml` carries the rules either way: `HighErrorRate` (>5% 5xx),
+`SearchLatencyP95High` (retrieve p95 > 1.5s — the decoupling SLA), `RateLimitSpike`
+(>50 throttled in 5m, possible abuse), and `LLMCostSpike` (>$5/hour, runaway spend).
+
+Prometheus is deliberately **not** a Fly process group: its TSDB wants a
+persistent volume, and paying for a per-app time-series database is the wrong
+trade when option 1 and option 2 both exist.
 
 ## CI/CD (optional)
 
@@ -192,3 +301,17 @@ the clip service) is a burst cost only — rent it for a big backfill, kill it a
   from your site's origin (see `.env.example`).
 - **`clip` unreachable** → confirm `CLIP_SERVICE_URL` in fly.toml matches the
   app name (`clip.process.<app>.internal:8001`).
+- **`401 Missing or invalid API key` everywhere after setting `ADMIN_TOKEN`** →
+  expected: auth activates the moment the token exists. Send
+  `Authorization: Bearer <ADMIN_TOKEN>`, or mint a key (step 3b). The UI and
+  `/dashboard` both prompt for one.
+- **`/admin/*` still open on the public URL** → `ADMIN_TOKEN` isn't set and no key
+  has been minted, so auth is inactive (fail-open dev default). `fly secrets list`
+  to confirm, then step 3b.
+- **Rate limit seems too generous, or `/metrics` numbers jump around** → more than
+  one api machine with no `REDIS_URL`; each keeps its own counters. Step 3a.
+- **`[redis] unavailable` in the logs** → wrong URL, or the Upstash instance is in
+  another region/org. The app keeps serving on the in-memory fallback, so this
+  never pages — but it won't be multi-replica-correct until it's fixed.
+- **Prometheus target shows `401`** → the scrape token doesn't match. The compose
+  stack reads `ADMIN_TOKEN` from `.env`; make sure it equals the Fly secret.
