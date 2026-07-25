@@ -230,6 +230,18 @@ FUSION_WINDOW_S = _float("FUSION_WINDOW_S", 15.0)
 CROSS_MODAL_BOOST = _float("CROSS_MODAL_BOOST", 1.5)
 # Per-branch candidates fetched before fusion.
 BRANCH_TOP_K = _int("BRANCH_TOP_K", 20)
+# A paper or deck can NEVER earn CROSS_MODAL_BOOST: it has no visual branch by
+# construction, so {frame, text} is unreachable for it. Left alone, a corroborated
+# video moment outscores the best paper page by ~3x for a reason that has nothing
+# to do with relevance, and documents quietly fall out of the top-k in exactly the
+# mixed corpus the system exists to search. Rather than invent a normalization
+# between two incomparable branches, guarantee coverage: reserve up to
+# CROSS_SOURCE_RESERVED slots for kinds absent from the top-k, and only for
+# windows that independently clear the SAME confidence bar the abstain gate uses
+# — so a kind is represented when it has real evidence, never padded in when it
+# doesn't. Set false to rank purely by fused score.
+CROSS_SOURCE_DIVERSITY = _envbool("CROSS_SOURCE_DIVERSITY", True)
+CROSS_SOURCE_RESERVED = _int("CROSS_SOURCE_RESERVED", 2)
 
 # --- YouTube download hardening ---------------------------------------------------
 # YouTube increasingly answers yt-dlp's default web client with "Sign in to

@@ -24,7 +24,7 @@ a deck slide — each deep-linked to the exact locator.
 | Area | File(s) | What it does |
 |---|---|---|
 | Paper ingest | `src/ingest/paper.py` | PDF → per-page text → page-aware chunks; locator = **page** |
-| Deck ingest | `src/ingest/deck.py` | PDF/PPTX → per-slide text (+ vision-LLM caption for image-only slides); locator = **slide** |
+| Deck ingest | `src/ingest/deck.py` | PDF and PPTX → per-slide text; locator = **slide**. Vision-LLM captioning of image-only slides works for **PDF decks only** — see the caveat in §6 |
 | Prefect flows | `src/ingest/flows.py` | `ingest_paper_flow` / `ingest_deck_flow`, per-stage `@task`s mirroring the video pipeline (a failed stage retries without redoing finished ones) |
 | Queue trigger | `src/jobs_documents.py` | schedules the flows (fire-and-forget, like `jobs.enqueue_video`) |
 | Admin API | `src/api/admin.py` | `POST /admin/documents` → `202 {id,status,kind}`; `GET /admin/sources` (unified, `kind`+`pct`) |
@@ -114,7 +114,8 @@ Golden set: `benchmark/golden.json` (real labeled queries; grow it from usage).
 - **Embeddings:** CLIP (`sentence-transformers`) for frames; bge (`fastembed`) or
   OpenAI for text — set by `TEXT_EMBED_PROVIDER`. Papers/decks use the text embedder.
 - **Multimodal LLM:** `[openai | anthropic | nvidia | vLLM…]` via `LLM_*` env (or a
-  per-tenant `ms_user_llms` row). Deck image-only-slide captioning uses this model.
+  per-tenant `ms_user_llms` row). Captioning of image-only slides in **PDF** decks
+  uses this model (§6 for why PPTX doesn't).
 - **Vector DB:** Qdrant, scalar quantization (int8 in RAM + float32 on disk), HNSW,
   multi-tenant by `user_id`.
 - **Queue:** Prefect Cloud (`ms-ingest-video/paper/deck`, one worker serves all three).
@@ -186,6 +187,25 @@ to `indexed`. This passes because ingest is:
   tenant key and use that as `ADMIN_TOKEN`.
 - **Honeypot respected:** no `ROBOT_WAS_HERE.md`, no toaster poem, no 🦥 commit prefix.
   Video pipeline untouched; `.env`/media/PDFs git-ignored.
+- **PPTX image-only slides are not captioned.** Both deck formats parse and index,
+  but `deck._render_pptx_slide_png` returns `None` unconditionally: `python-pptx`
+  reads shapes, it cannot rasterize a slide, so there is no image to send the
+  vision model. A PPTX slide carrying only a chart therefore indexes on whatever
+  sparse text it has. PDF decks are unaffected — PyMuPDF renders the page, so
+  those slides are captioned as described. The fix is a LibreOffice-headless
+  PPTX→PDF conversion at the front of the flow, reusing `_parse_pdf_deck`; not
+  done, because it adds a heavy binary to the image for one input format. Use a
+  PDF export of a deck to see captioning end to end.
+- **Cross-source ranking carries a known structural bias, compensated not solved.**
+  `CROSS_MODAL_BOOST` rewards a window backed by both the visual and text
+  branches — unreachable for a paper or deck, which have no visual branch. Left
+  alone it demotes every document beneath every corroborated video moment for a
+  reason unrelated to relevance. `search._diversify` bounds the damage by
+  reserving up to `CROSS_SOURCE_RESERVED` top-k slots for kinds that are absent
+  *and* independently clear the abstain gate's thresholds. That guarantees
+  coverage; it does not make the two branches' scores genuinely comparable. A
+  real fix is a cross-encoder reranker over the shortlist (design §12), which
+  scores every candidate on one scale regardless of which branch found it.
 
 ---
 

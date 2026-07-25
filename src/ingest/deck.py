@@ -16,6 +16,14 @@ caption them with the repo's multimodal LLM (`src/llm.py :: answer`, env- or
 tenant-switched) BEFORE embedding — otherwise those slides retrieve poorly (a
 graded pitfall). The repo has no dedicated `caption_image`, so `_caption` wraps
 `llm.answer` with a single-image "moment".
+
+LIMITATION — captioning is **PDF-only**. PyMuPDF rasterizes a PDF page, so an
+image-only slide in a PDF deck gets a caption. `python-pptx` reads shapes and
+cannot render a slide, so `_render_pptx_slide_png` has nothing to hand the vision
+model and returns None: an image-only PPTX slide indexes on its sparse text
+alone. Closing this means a LibreOffice-headless PPTX→PDF conversion up front,
+reusing `_parse_pdf_deck` — a heavy binary in the image for one input format,
+so it is deliberately not done. Export the deck to PDF to get captioning.
 """
 from __future__ import annotations
 
@@ -78,7 +86,8 @@ def _caption(png: bytes) -> str:
 
 # 1) PARSE ─────────────────────────────────────────────────────────────────────
 def parse_deck(data: bytes, filename: str = "") -> list[Slide]:
-    """Deck bytes → per-slide text. Handles PPTX and PDF; captions image-only slides."""
+    """Deck bytes → per-slide text. Handles PPTX and PDF; captions image-only
+    slides in PDF decks only (see the module docstring)."""
     if filename.lower().endswith(".pptx"):
         return _parse_pptx(data)
     return _parse_pdf_deck(data)
@@ -117,12 +126,19 @@ def _parse_pdf_deck(data: bytes) -> list[Slide]:
 
 
 def _render_pptx_slide_png(slide) -> bytes | None:  # noqa: ANN001
-    """
-    python-pptx can't rasterize a slide on its own. Options (pick one, ADAPT):
-      • pull embedded picture shapes' blobs and caption those, or
+    """Always None — PPTX slides are never captioned. NOT a stub left by mistake.
+
+    python-pptx reads shapes; it cannot rasterize a slide, and there is no
+    pure-Python renderer for PowerPoint layout. The two ways out:
       • convert the PPTX to PDF once (LibreOffice headless) and reuse
-        `_parse_pdf_deck` (simplest — one code path for rasterization).
-    Returning None just skips captioning for that slide.
+        `_parse_pdf_deck` — one rasterization path, but a ~400mb binary in the
+        image for a single input format; or
+      • pull embedded picture shapes' blobs and caption those individually —
+        cheap, but it captions pictures, not slides: layout, title and chart
+        text around the image are lost, which is most of what makes a slide
+        findable.
+    Neither is worth it while PDF decks (the common export) caption correctly.
+    Returning None degrades to text-only indexing for that slide — never fatal.
     """
     return None
 

@@ -97,12 +97,73 @@ def _fuse(visual_hits: list[dict], text_hits: list[dict]) -> list[dict]:
     for w in windows:
         # Score = best frame + best transcript hit; ×boost when BOTH modalities
         # agree at this instant (two independent signals = strongest evidence).
+        # +DOC: unreachable for a document — it has no visual branch — so this
+        # ranks video moments against each OTHER honestly but handicaps papers
+        # and decks against them. _diversify() compensates on the way out.
         w["rrf"] = (w["frame"]["rrf"] if w["frame"] else 0.0) + \
                    (w["text"]["rrf"] if w["text"] else 0.0)
         if {"frame", "text"} <= w["modalities"]:
             w["rrf"] *= CROSS_MODAL_BOOST
     windows.sort(key=lambda w: w["rrf"], reverse=True)
     return windows
+
+
+# +DOC ─ cross-source coverage in the returned top-k.
+def _kind_of(w: dict) -> str:
+    return w.get("kind") or "video"
+
+
+def _credible(w: dict) -> bool:
+    """Does this window stand on its own evidence?
+
+    Deliberately the SAME test as Gate 1 in ask(): each branch judged against its
+    own raw-score threshold, because CLIP cosines (~0.2-0.35) and bge cosines
+    (~0.5-0.7) are not on one scale. If a window wouldn't survive the abstain
+    gate, it has no business being promoted into the answer for variety's sake.
+    """
+    fr = float((w.get("frame") or {}).get("score") or 0.0)
+    tx = float((w.get("text") or {}).get("score") or 0.0)
+    return fr >= CONFIDENCE_THRESHOLD or tx >= TEXT_CONFIDENCE_THRESHOLD
+
+
+def _diversify(windows: list[dict], k: int) -> list[dict]:
+    """Make sure a kind with real evidence isn't ranked out of the top-k.
+
+    Why this is needed at all: CROSS_MODAL_BOOST multiplies a window scored by
+    BOTH branches, and a paper or deck lives only in the text branch — it cannot
+    reach {frame, text} no matter how relevant it is. So the boost, meant to
+    separate corroborated video moments from uncorroborated ones, also silently
+    demotes every document beneath every corroborated video moment. The boost
+    still does its intra-video job; this stops that side effect from costing a
+    document its citation in a mixed corpus (design §6's definition of done: one
+    query returns a video moment, a paper passage AND a slide).
+
+    Promotion is bounded and earned — at most CROSS_SOURCE_RESERVED slots, only
+    for kinds missing from the top-k, only for windows that pass _credible, and
+    never at the cost of the #1 result. An irrelevant kind is left out.
+    """
+    top = windows[:k]
+    if not config.CROSS_SOURCE_DIVERSITY or len(windows) <= k:
+        return top
+    budget = min(config.CROSS_SOURCE_RESERVED, max(0, k - 1))
+    if budget <= 0:
+        return top
+
+    present = {_kind_of(w) for w in top}
+    promoted: list[dict] = []
+    for w in windows[k:]:
+        if len(promoted) >= budget:
+            break
+        kind = _kind_of(w)
+        if kind in present or not _credible(w):
+            continue
+        promoted.append(w)
+        present.add(kind)          # one slot per kind, not one per hit
+    if not promoted:
+        return top
+
+    keep = top[:len(top) - len(promoted)]      # drop the weakest, keep the best
+    return sorted(keep + promoted, key=lambda w: w["rrf"], reverse=True)
 
 
 def _deeplink(video: dict | None, video_id: str, ms: int) -> str:
@@ -173,7 +234,9 @@ def retrieve(question: str, user_id: str, *, top_k: int | None = None,
                                          video_ids=video_ids)
         best_text = thits[0]["score"] if thits else 0.0
 
-    windows = _fuse(vhits, thits)[:k]
+    # +DOC: fuse ranks by score; _diversify then guarantees a kind with real
+    # evidence isn't ranked out by a boost it structurally cannot earn.
+    windows = _diversify(_fuse(vhits, thits), k)
     videos = db.videos_by_ids(sorted({w["video_id"] for w in windows}))
     citations = []
     for i, w in enumerate(windows, 1):
