@@ -13,6 +13,13 @@ scrape_configs:
     authorization:
       type: Bearer
       credentials_file: /tmp/prom_token
+    # Pointed at the DEPLOYED app. The dashboard panels are unfiltered `sum(...)`,
+    # so scraping prod and a local api at the same time would double-count every
+    # number — hence one active target, not two jobs.
+    # Local dev instead: swap the two blocks below (drop `scheme`, use api:8000).
+    scheme: https
     static_configs:
-      - targets: ['api:8000']
-        labels: { service: glimpse }
+      - targets: ['glimpse-lens.fly.dev']
+        labels: { service: glimpse, env: fly }
+    # - targets: ['api:8000']
+    #   labels: { service: glimpse, env: local }
